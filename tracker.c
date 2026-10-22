@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <dirent.h>
 
 #define BUF_SIZE    1024
 #define MAX_THREADS 100
@@ -43,6 +44,52 @@ static void send_all(int fd, const char *buf, size_t len) {
     }
 }
 
+/* Reads Filename, Filesize, and MD5 from one .track file; returns 1 if all were found */
+static int read_track_header(const char *path, char *name, long *size, char *md5) {
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return 0;
+    char line[512];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#') continue;
+        if (sscanf(line, "Filename: %255s", name) == 1) found |= 1;
+        else if (sscanf(line, "Filesize: %ld", size) == 1) found |= 2;
+        else if (sscanf(line, "MD5: %32s", md5) == 1) found |= 4;
+    }
+    fclose(f);
+    return found == 7;
+}
+
+static void handle_list(int client) {
+    char entries[8192] = "";
+    int count = 0;
+
+    DIR *dir = opendir(shared_dir);
+    if (dir != NULL) {
+        struct dirent *e;
+        while ((e = readdir(dir)) != NULL) {
+            size_t len = strlen(e->d_name);
+            if (len < 7 || strcmp(e->d_name + len - 6, ".track") != 0) continue;
+
+            char path[600], name[256], md5[33];
+            long size;
+            snprintf(path, sizeof(path), "%s/%s", shared_dir, e->d_name);
+            if (!read_track_header(path, name, &size, md5)) continue;
+
+            char row[400];
+            snprintf(row, sizeof(row), "<%d %s %ld %s>\n", ++count, name, size, md5);
+            strncat(entries, row, sizeof(entries) - strlen(entries) - 1);
+        }
+        closedir(dir);
+    }
+
+    char header[64];
+    snprintf(header, sizeof(header), "<REP LIST %d>\n", count);
+    send_all(client, header, strlen(header));
+    send_all(client, entries, strlen(entries));
+    send_all(client, "<REP LIST END>\n", 15);
+}
+
 void *handle_client(void *arg) {
     int client = *(int *)arg;
     free(arg);
@@ -63,9 +110,7 @@ void *handle_client(void *arg) {
     if (n > 0) {
         printf("Received: %s", buf);
         if (strncmp(buf, "<REQ LIST>", 10) == 0) {
-            /* TODO: replace placeholder with real .track file list */
-            const char *reply = "<REP LIST 0>\n<REP LIST END>\n";
-            send_all(client, reply, strlen(reply));
+            handle_list(client);
         }
     }
 
