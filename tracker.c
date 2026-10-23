@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <dirent.h>
+#include <time.h>
 
 #define BUF_SIZE    1024
 #define MAX_THREADS 100
@@ -60,6 +61,47 @@ static int read_track_header(const char *path, char *name, long *size, char *md5
     return found == 7;
 }
 
+static void handle_createtracker(int client, const char *msg) {
+    char name[256], desc[256], md5[33], ip[64];
+    long size;
+    int peer_port;
+    const char *fail = "<createtracker fail>\n";
+    const char *ferr = "<createtracker ferr>\n";
+    const char *succ = "<createtracker succ>\n";
+
+    if (sscanf(msg, "<createtracker %255s %ld %255s %32s %63s %d>",
+               name, &size, desc, md5, ip, &peer_port) != 6
+        || strchr(name, '/') != NULL || size < 0) {
+        send_all(client, fail, strlen(fail));
+        return;
+    }
+
+    /* peers send underscores for spaces; store spaces like the spec example */
+    for (char *c = desc; *c; c++) if (*c == '_') *c = ' ';
+
+    char path[600];
+    snprintf(path, sizeof(path), "%s/%s.track", shared_dir, name);
+
+    /* "wx" fails if the file already exists, so two peers can't both create it */
+    FILE *f = fopen(path, "wx");
+    if (f == NULL) {
+        FILE *exists = fopen(path, "r");
+        if (exists) { fclose(exists); send_all(client, ferr, strlen(ferr)); }
+        else send_all(client, fail, strlen(fail));
+        return;
+    }
+
+    fprintf(f, "Filename: %s\n", name);
+    fprintf(f, "Filesize: %ld\n", size);
+    fprintf(f, "Description: %s\n", desc);
+    fprintf(f, "MD5: %s\n", md5);
+    fprintf(f, "#list of peers follows next\n");
+    fprintf(f, "%s:%d:0:%ld:%ld\n", ip, peer_port, size, (long)time(NULL));
+    fclose(f);
+
+    send_all(client, succ, strlen(succ));
+}
+
 static void handle_list(int client) {
     char entries[8192] = "";
     int count = 0;
@@ -111,6 +153,8 @@ void *handle_client(void *arg) {
         printf("Received: %s", buf);
         if (strncmp(buf, "<REQ LIST>", 10) == 0) {
             handle_list(client);
+        } else if (strncmp(buf, "<createtracker ", 15) == 0) {
+            handle_createtracker(client, buf);
         }
     }
 
