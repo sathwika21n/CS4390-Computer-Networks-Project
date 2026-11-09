@@ -14,7 +14,7 @@ increment; it does not establish completion of the other components.
 These responsibilities follow the existing downloader integration notes. Other
 members' implementations and completion status are not verified on this branch.
 
-## Veda's current progress
+## current progress
 
 The downloader connects to one TCP peer, requests file ranges sequentially,
 receives binary chunks, and writes them at their correct offsets. It is blocking
