@@ -1,4 +1,4 @@
-# Veda's downloader: first increment
+# Downloader
 
 This Linux/POSIX C module implements four features: connect to a TCP peer,
 request/receive chunks, divide a file into segments, and reconstruct the output
@@ -107,17 +107,6 @@ and timeouts, concurrency, persistent resume, hashes and safe final publication.
 Integrate tracker metadata/menu/update calls with Sathwika; agree server framing
 and checksum handling with Kriti; coordinate tracker semantics with Jazminee.
 Team feature completion is not established by this downloader branch.
-
-## Five likely teammate questions
-
-1. Why TCP? It provides an ordered byte stream; we still handle partial I/O.
-2. Why split a file? Small ranges give us a foundation for later distribution
-   and retries; right now we fetch them sequentially from one peer.
-3. How do chunks become one file? pwrite places each block at its byte offset.
-4. What if a peer disconnects? We return an error; inspect/remove the partial
-   destination and retry. Automatic fallback and resume are deferred.
-5. Is this ready for the tracker and real server? It is a standalone interface
-   and provisional protocol; metadata and server integration remain team work.
 
 ## Preserved full version and staging
 
