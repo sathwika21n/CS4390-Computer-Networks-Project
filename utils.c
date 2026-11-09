@@ -67,3 +67,14 @@ int writeChunk(const char *filename, long offset, const char *buffer, size_t siz
     fclose(file);
     return (int)bytesWritten;
 }
+
+// Shared folder management
+void initSharedFolder(const char *path) {
+    struct stat st = {0};
+    if (stat(path, &st) == -1) {
+        mkdir(path, 0700);
+        printf("[SharedFolder] Created missing directory: %s\n", path);
+    } else {
+        printf("[SharedFolder] Using existing directory: %s\n", path);
+    }
+}

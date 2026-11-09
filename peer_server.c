@@ -71,7 +71,7 @@ void *handle_peer_request(void *client_socket_ptr) {
 }
 
 int main() {
-    int server_sock, *client_sock;
+    int server_sock;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
 

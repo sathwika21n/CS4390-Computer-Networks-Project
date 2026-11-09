@@ -15,4 +15,6 @@ int calculateMD5(const char *filename, char *md5_string);
 int readChunk(const char *filename, long offset, char *buffer, size_t size);
 int writeChunk(const char *filename, long offset, const char *buffer, size_t size);
 
+// Shared Folder Utility
+void initSharedFolder(const char *path);
 #endif
