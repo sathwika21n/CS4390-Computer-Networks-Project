@@ -11,8 +11,7 @@ increment; it does not establish completion of the other components.
 - Kriti: peer server and checksum utilities.
 - Veda: TCP downloader, segmentation, chunk requests, and file reconstruction.
 
-These responsibilities follow the existing downloader integration notes. Other
-members' implementations and completion status are not verified on this branch.
+These responsibilities follow the existing downloader integration notes.
 
 ## current progress
 
