@@ -155,6 +155,12 @@ void *handle_client(void *arg) {
             handle_list(client);
         } else if (strncmp(buf, "<createtracker ", 15) == 0) {
             handle_createtracker(client, buf);
+        } else if (strncmp(buf, "<updatetracker ", 15) == 0) {
+            char fname[256] = "unknown";
+            sscanf(buf, "<updatetracker %255s", fname);
+            char reply[300];
+            snprintf(reply, sizeof(reply), "<updatetracker %s fail>\n", fname);
+            send_all(client, reply, strlen(reply));
         }
     }
 
