@@ -38,10 +38,10 @@ void *handle_peer_request(void *client_socket_ptr) {
 
     // Parse request (Expected format example: "GET filename offset size")
     char filename[256];
-    long offset = 0;
+    uint64_t offset = 0;
     size_t chunk_size = 0;
 
-    if (sscanf(buffer, "GET %255s %ld %zu", filename, &offset, &chunk_size) == 3) {
+    if (sscanf(buffer, "GET_CHUNK %255s %" SCNu64 " %zu", filename, &offset, &chunk_size) == 3) {
         char file_path[512];
         snprintf(file_path, sizeof(file_path), "./shared_files/%s", filename);
 
@@ -54,6 +54,10 @@ void *handle_peer_request(void *client_socket_ptr) {
 
         int bytes_read = readChunk(file_path, offset, chunk_buffer, chunk_size);
         if (bytes_read > 0) {
+            char header[80];
+            int hdr_len = snprintf(header, sizeof(header), "CHUNK %d\n", bytes_read);
+            send(client_sock, header, hdr_len, 0);
+
             send(client_sock, chunk_buffer, bytes_read, 0);
         } else {
             char *err = "ERROR: Failed to read file chunk\n";
