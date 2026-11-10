@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <inttypes.h>
 #include "utils.h"
 
 #define PORT 9001  // Default port, can be overridden by config
