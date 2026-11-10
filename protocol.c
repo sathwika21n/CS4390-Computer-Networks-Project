@@ -314,7 +314,7 @@ int protocol_md5_file(const char *path, char digest[PROTOCOL_MD5_HEX_LEN + 1])
     }
 #else
     if (EVP_DigestFinal_ex(context, hash, &hash_length) != 1 ||
-        hash_length != PROTOCOL_MD5_HEX_LEN) {
+        hash_length != PROTOCOL_MD5_HEX_LEN / 2) {
         EVP_MD_CTX_free(context);
         fclose(file);
         errno = EIO;
