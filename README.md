@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # CS4390-Computer-Networks-Project
 
 ## Peer client (midterm scope)
