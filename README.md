@@ -1,5 +1,5 @@
 # CS4390-Computer-Networks-Project
-
+Check out Project Outline: https://docs.google.com/document/d/1LWsZo2D4uYXuAwpFO6OcWllf97uuh9KJos3dZKTnB6c/edit?usp=sharing
 ## Peer client (midterm scope)
 
 The peer client implements the peer-to-tracker `createtracker`, `updatetracker`,
