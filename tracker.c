@@ -6,6 +6,9 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <dirent.h>
+#include <limits.h>
+#include <stdint.h>
+#include <sys/time.h>
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
@@ -152,8 +155,68 @@ static void handle_create(int fd, const protocol_request_t *req) {
     reply_create(fd, ok ? "succ" : "fail");
 }
 
-/* Keep disjoint ranges for one endpoint. A new range replaces the rows it covers.
-   A temporary file and rename prevent readers from seeing a half-written tracker. */
+/* A .track record describes an inclusive byte range. The latest announcement
+   extends the requesting endpoint's current ranges, without discarding disjoint
+   segments. Stale entries from other peers are removed during an update. */
+typedef struct {
+    unsigned long long first, last;
+} byte_range;
+
+static int range_order(const void *a, const void *b) {
+    const byte_range *x = a, *y = b;
+    if (x->first != y->first) return x->first < y->first ? -1 : 1;
+    return (x->last > y->last) - (x->last < y->last);
+}
+
+static int add_range(byte_range **list, size_t *count, size_t *capacity,
+                     unsigned long long first, unsigned long long last) {
+    if (*count == *capacity) {
+        if (*capacity > SIZE_MAX / (2 * sizeof(**list))) return -1;
+        size_t next = *capacity ? *capacity * 2 : 8;
+        byte_range *grown = realloc(*list, next * sizeof(**list));
+        if (!grown) return -1;
+        *list = grown;
+        *capacity = next;
+    }
+    (*list)[(*count)++] = (byte_range){first, last};
+    return 0;
+}
+
+/* Called with file_lock held. For GET, cleanup must run before computing MD5. */
+static int remove_expired(const char *path) {
+    FILE *src = fopen(path, "r");
+    if (!src) return -1;
+    char temp[650];
+    if (snprintf(temp, sizeof(temp), "%s/.expireXXXXXX", shared_dir) >= (int)sizeof(temp)) {
+        fclose(src);
+        return -1;
+    }
+    int fd = mkstemp(temp);
+    if (fd < 0) { fclose(src); return -1; }
+    FILE *dst = fdopen(fd, "w");
+    if (!dst) { close(fd); unlink(temp); fclose(src); return -1; }
+    char line[2048];
+    time_t now = time(NULL);
+    int ok = 1, changed = 0;
+    while (fgets(line, sizeof(line), src)) {
+        char ip[64];
+        unsigned int port;
+        unsigned long long first, last;
+        long long stamp;
+        if (is_peer_entry(line, ip, sizeof(ip), &port, &first, &last, &stamp) &&
+            (stamp <= 0 || (long long)now - stamp > dead_peer_seconds)) {
+            changed = 1;
+            continue;
+        }
+        if (fputs(line, dst) == EOF) { ok = 0; break; }
+    }
+    if (ferror(src) || fclose(src) != 0) ok = 0;
+    if (fclose(dst) != 0) ok = 0;
+    if (ok && changed && rename(temp, path) != 0) ok = 0;
+    if (!changed || !ok) unlink(temp);
+    return ok ? 0 : -1;
+}
+
 static void handle_update(int fd, const protocol_request_t *req) {
     char path[600];
     if (tracker_path(path, sizeof(path), req->filename) != 0 || !valid_ip(req->ip_address)) {
@@ -172,16 +235,24 @@ static void handle_update(int fd, const protocol_request_t *req) {
     char name[256], md5[33];
     if (!read_track_header(path, name, &filesize, md5) || filesize < 0 ||
         (filesize ? req->start_bytes >= (uint64_t)filesize : req->start_bytes != 0) ||
-        req->end_bytes > (uint64_t)filesize) {
+        req->end_bytes > (uint64_t)filesize ||
+        (filesize && req->end_bytes < req->start_bytes) ||
+        (!filesize && (req->start_bytes != 0 || req->end_bytes != 0))) {
         fclose(src);
         pthread_mutex_unlock(&file_lock);
         reply_update(fd, req->filename, "fail");
         return;
     }
     unsigned long long last = req->end_bytes;
+    /* Accept the legacy file-size endpoint, but always store inclusive ranges. */
     if (filesize && last == (uint64_t)filesize) --last;
     char temp[650];
-    snprintf(temp, sizeof(temp), "%s/.updateXXXXXX", shared_dir);
+    if (snprintf(temp, sizeof(temp), "%s/.updateXXXXXX", shared_dir) >= (int)sizeof(temp)) {
+        fclose(src);
+        pthread_mutex_unlock(&file_lock);
+        reply_update(fd, req->filename, "fail");
+        return;
+    }
     int tmpfd = mkstemp(temp);
     if (tmpfd < 0) {
         fclose(src);
@@ -196,12 +267,14 @@ static void handle_update(int fd, const protocol_request_t *req) {
         reply_update(fd, req->filename, "fail");
         return;
     }
-    char line[2048];
+    byte_range *ranges = NULL;
+    size_t count = 0, capacity = 0;
     int ok = 1;
     time_t now = time(NULL);
+    char line[2048];
     while (fgets(line, sizeof(line), src)) {
         char ip[64];
-        unsigned int p = 0;
+        unsigned int port = 0;
         unsigned long long first, end;
         long long timestamp = 0;
         if (is_peer_entry(line, ip, sizeof(ip), &p, &first, &end, &timestamp)) {
@@ -212,11 +285,26 @@ static void handle_update(int fd, const protocol_request_t *req) {
         if (fputs(line, dst) == EOF) { ok = 0; break; }
     }
     if (ferror(src)) ok = 0;
-    if (ok && filesize && fprintf(dst, "%s:%u:%llu:%llu:%lld\n", req->ip_address,
-                      (unsigned)req->port,
-                      (unsigned long long)req->start_bytes,
-                      last,
-                      (long long)now) < 0) ok = 0;
+    if (ok && filesize && add_range(&ranges, &count, &capacity,
+                                    req->start_bytes, last)) ok = 0;
+    if (ok && count) {
+        qsort(ranges, count, sizeof(*ranges), range_order);
+        size_t output = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (output && ranges[i].first <= ranges[output - 1].last + 1) {
+                if (ranges[i].last > ranges[output - 1].last)
+                    ranges[output - 1].last = ranges[i].last;
+            } else {
+                ranges[output++] = ranges[i];
+            }
+        }
+        for (size_t i = 0; i < output; ++i) {
+            if (fprintf(dst, "%s:%u:%llu:%llu:%lld\n", req->ip_address,
+                        (unsigned)req->port, ranges[i].first, ranges[i].last,
+                        (long long)now) < 0) { ok = 0; break; }
+        }
+    }
+    free(ranges);
     if (fclose(src) != 0) ok = 0;
     if (fclose(dst) != 0) ok = 0;
     if (ok && rename(temp, path) != 0) ok = 0;
@@ -240,11 +328,13 @@ static void handle_list(int fd) {
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (!ends_with_track(entry->d_name)) continue;
+        if (!valid_name(entry->d_name)) continue;
         char path[600], name[256] = "", md5[33] = "";
         long long size = 0;
         int pn = snprintf(path, sizeof(path), "%s/%s", shared_dir, entry->d_name);
         if (pn < 0 || (size_t)pn >= sizeof(path) ||
             !read_track_header(path, name, &size, md5)) continue;
+        if (remove_expired(path) != 0) continue;
         char row[512];
         snprintf(row, sizeof(row), "<%zu %s %lld %s>", count + 1, name, size, md5);
         if (count == capacity) {
@@ -278,6 +368,10 @@ static void handle_get(int fd, const protocol_request_t *req) {
     int pn = snprintf(path, sizeof(path), "%s/%s", shared_dir, req->filename);
     if (pn < 0 || (size_t)pn >= sizeof(path)) return;
     pthread_mutex_lock(&file_lock);
+    if (remove_expired(path) != 0) {
+        pthread_mutex_unlock(&file_lock);
+        return;
+    }
     FILE *f = fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "GET: missing tracker %s\n", req->filename);
@@ -316,6 +410,9 @@ static void *handle_client(void *arg) {
     int fd = *(int *)arg;
     free(arg);
     char line[PROTOCOL_LINE_MAX];
+    const struct timeval timeout = {3, 0};
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     int status = protocol_read_line(fd, line, sizeof(line));
     if (status == 1) {
         protocol_request_t req;
