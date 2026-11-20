@@ -277,7 +277,7 @@ static void handle_update(int fd, const protocol_request_t *req) {
         unsigned int port = 0;
         unsigned long long first, end;
         long long timestamp = 0;
-        if (is_peer_entry(line, ip, sizeof(ip), &p, &first, &end, &timestamp)) {
+        if (is_peer_entry(line, ip, sizeof(ip), &port, &first, &end, &timestamp)) {
             /* The requesting peer gets a fresh entry below. */
             if (strcmp(ip, req->ip_address) == 0 && p == req->port) continue;
             if (timestamp <= 0 || (long long)now - timestamp > dead_peer_seconds) continue;
