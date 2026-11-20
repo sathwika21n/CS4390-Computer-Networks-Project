@@ -102,6 +102,7 @@ void *handle_peer_request(void *client_socket_ptr) {
         sscanf(buffer, "GET_CHUNK %255s %20s %1024s %c", filename, offset_text,
                length_text, &extra) == 3 &&
         !strchr(filename, '/') && !strchr(filename, '\\') &&
+        !strstr(filename, "..") &&
         strcmp(filename, ".") && strcmp(filename, "..") &&
         !parse_decimal(offset_text, LONG_MAX, &offset) &&
         length_text[strspn(length_text, "0123456789")] == '\0' &&
@@ -113,19 +114,28 @@ void *handle_peer_request(void *client_socket_ptr) {
             close(client_sock);
             return NULL;
         }
+
         char file_path[1024];
         snprintf(file_path, sizeof(file_path), "%s/%s", shared_directory, filename);
 
         char chunk_buffer[MAX_CHUNK_SIZE];
         int bytes_read = readChunk(file_path, (long)offset, chunk_buffer, (size_t)length);
-        if (bytes_read != (int)length &&
-            !dl_read_partial(download_directory, filename, offset, chunk_buffer, (size_t)length))
-            bytes_read = (int)length;
-        if (bytes_read == (int)length) {
+        int chunk_ok = (bytes_read == (int)length);
+
+        if (!chunk_ok) {
+            /* Fall back to partial download storage when the complete shared file isn't present. */
+            if (dl_read_partial(download_directory, filename, offset, chunk_buffer, (size_t)length) == 0) {
+                bytes_read = (int)length;
+                chunk_ok = 1;
+            }
+        }
+
+        if (chunk_ok && bytes_read > 0) {
             char header[80];
             int hdr_len = snprintf(header, sizeof(header), "CHUNK %d\n", bytes_read);
-            if (!send_all(client_sock, header, (size_t)hdr_len))
+            if (!send_all(client_sock, header, (size_t)hdr_len)) {
                 send_all(client_sock, chunk_buffer, (size_t)bytes_read);
+            }
         } else {
             const char *err = "ERROR: Failed to read file chunk\n";
             send_all(client_sock, err, strlen(err));
