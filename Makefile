@@ -12,11 +12,11 @@ all: tracker peer_client peer_server
 tracker: tracker.c utils.c protocol.c
 	$(CC) $(CFLAGS) tracker.c utils.c protocol.c -o tracker $(LIBS)
 
-peer_client: peer_client.c downloader.c utils.c protocol.c
+peer_client: peer_client.c downloader.c downloader.h utils.c protocol.c
 	$(CC) $(CFLAGS) peer_client.c downloader.c utils.c protocol.c -o peer_client $(LIBS)
 
-peer_server: peer_server.c utils.c
-	$(CC) $(CFLAGS) peer_server.c utils.c -o peer_server
+peer_server: peer_server.c downloader.c downloader.h utils.c protocol.c
+	$(CC) $(CFLAGS) peer_server.c downloader.c utils.c protocol.c -o peer_server $(LIBS)
 
 clean:
 	rm -f tracker peer_client peer_server *.o

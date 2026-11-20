@@ -85,11 +85,11 @@ static int ends_with_track(const char *filename) {
 }
 
 static int is_peer_entry(const char *line, char *ip, size_t ip_cap,
-                         unsigned int *port, long long *stamp) {
-    unsigned long long start, end;
+                         unsigned int *port, unsigned long long *start,
+                         unsigned long long *end, long long *stamp) {
     char parsed_ip[64], extra;
     if (sscanf(line, "%63[^:]:%u:%llu:%llu:%lld %c", parsed_ip,
-               port, &start, &end, stamp, &extra) != 5) return 0;
+               port, start, end, stamp, &extra) != 5) return 0;
     if (strlen(parsed_ip) >= ip_cap || !valid_ip(parsed_ip)) return 0;
     strcpy(ip, parsed_ip);
     return 1;
@@ -140,17 +140,19 @@ static void handle_create(int fd, const protocol_request_t *req) {
     snprintf(desc, sizeof(desc), "%s", req->description);
     for (char *p = desc; *p; ++p) if (*p == '_') *p = ' ';
     int ok = fprintf(f, "Filename: %s\nFilesize: %llu\nDescription: %s\nMD5: %s\n"
-                        "#list of peers follows next\n%s:%u:0:%llu:%lld\n",
+                        "#list of peers follows next\n",
                      req->filename, (unsigned long long)req->filesize,
-                     desc, req->md5, req->ip_address, (unsigned)req->port,
-                     (unsigned long long)req->filesize, (long long)time(NULL)) >= 0;
+                     desc, req->md5) >= 0;
+    if (ok && req->filesize)
+        ok = fprintf(f, "%s:%u:0:%llu:%lld\n", req->ip_address, (unsigned)req->port,
+                     (unsigned long long)(req->filesize - 1), (long long)time(NULL)) >= 0;
     if (fclose(f) != 0) ok = 0;
     if (!ok) unlink(path);
     pthread_mutex_unlock(&file_lock);
     reply_create(fd, ok ? "succ" : "fail");
 }
 
-/* Replace one peer's entry, add new peers, and drop entries whose refresh expired.
+/* Keep disjoint ranges for one endpoint. A new range replaces the rows it covers.
    A temporary file and rename prevent readers from seeing a half-written tracker. */
 static void handle_update(int fd, const protocol_request_t *req) {
     char path[600];
@@ -166,6 +168,18 @@ static void handle_update(int fd, const protocol_request_t *req) {
         reply_update(fd, req->filename, status);
         return;
     }
+    long long filesize;
+    char name[256], md5[33];
+    if (!read_track_header(path, name, &filesize, md5) || filesize < 0 ||
+        (filesize ? req->start_bytes >= (uint64_t)filesize : req->start_bytes != 0) ||
+        req->end_bytes > (uint64_t)filesize) {
+        fclose(src);
+        pthread_mutex_unlock(&file_lock);
+        reply_update(fd, req->filename, "fail");
+        return;
+    }
+    unsigned long long last = req->end_bytes;
+    if (filesize && last == (uint64_t)filesize) --last;
     char temp[650];
     snprintf(temp, sizeof(temp), "%s/.updateXXXXXX", shared_dir);
     int tmpfd = mkstemp(temp);
@@ -188,8 +202,9 @@ static void handle_update(int fd, const protocol_request_t *req) {
     while (fgets(line, sizeof(line), src)) {
         char ip[64];
         unsigned int p = 0;
+        unsigned long long first, end;
         long long timestamp = 0;
-        if (is_peer_entry(line, ip, sizeof(ip), &p, &timestamp)) {
+        if (is_peer_entry(line, ip, sizeof(ip), &p, &first, &end, &timestamp)) {
             /* The requesting peer gets a fresh entry below. */
             if (strcmp(ip, req->ip_address) == 0 && p == req->port) continue;
             if (timestamp <= 0 || (long long)now - timestamp > dead_peer_seconds) continue;
@@ -197,10 +212,10 @@ static void handle_update(int fd, const protocol_request_t *req) {
         if (fputs(line, dst) == EOF) { ok = 0; break; }
     }
     if (ferror(src)) ok = 0;
-    if (ok && fprintf(dst, "%s:%u:%llu:%llu:%lld\n", req->ip_address,
+    if (ok && filesize && fprintf(dst, "%s:%u:%llu:%llu:%lld\n", req->ip_address,
                       (unsigned)req->port,
                       (unsigned long long)req->start_bytes,
-                      (unsigned long long)req->end_bytes,
+                      last,
                       (long long)now) < 0) ok = 0;
     if (fclose(src) != 0) ok = 0;
     if (fclose(dst) != 0) ok = 0;
