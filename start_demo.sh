@@ -8,7 +8,7 @@ TORRENTS_DIR="torrents"
 DEMO_ROOT="demo_runtime"
 BASE_CLIENT_CFG="${CLIENT_CFG:-clientThreadConfig.cfg}"
 
-TRACKER_HOST="127.0.0.1"
+TRACKER_HOST="csa-linux02"
 TRACKER_PORT="3490"
 PEER_IP="127.0.0.1"
 UPDATE_INTERVAL="15"
