@@ -73,7 +73,7 @@ cleanup() {
     echo "Demo cleanup complete."
 }
 
-trap cleanup INT TERM EXIT
+trap cleanup EXIT
 
 echo "=== Cleaning old builds and stale .track files ==="
 make clean
