@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "protocol.h"
+#include "downloader.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -385,6 +386,20 @@ static int ensure_md5_casefold_equal(const char *left, const char *right)
     return strcasecmp(left, right) == 0;
 }
 
+static int valid_md5(const char *value)
+{
+    size_t i;
+    if (strlen(value) != PROTOCOL_MD5_HEX_LEN) {
+        return 0;
+    }
+    for (i = 0; i < PROTOCOL_MD5_HEX_LEN; i++) {
+        if (!isxdigit((unsigned char)value[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static void command_get(void)
 {
     char filename[PROTOCOL_NAME_MAX];
@@ -528,6 +543,93 @@ static void *periodic_update_thread(void *unused)
     return NULL;
 }
 
+static void command_download_peer(void)
+{
+    char track_name[PROTOCOL_NAME_MAX];
+    char track_path[1024];
+    char output_name[PROTOCOL_NAME_MAX] = "";
+    char output_path[1024];
+    char md5[PROTOCOL_MD5_HEX_LEN + 1] = "";
+    char local_md5[PROTOCOL_MD5_HEX_LEN + 1];
+    char line[1024];
+    unsigned long long file_size = 0;
+    FILE *track;
+
+    if (read_prompt("Downloaded tracker filename: ", track_name, sizeof(track_name)) != 0 ||
+        !safe_filename(track_name) || strlen(track_name) < 7 ||
+        strcmp(track_name + strlen(track_name) - 6, ".track") != 0) {
+        fprintf(stderr, "Invalid tracker filename.\n");
+        return;
+    }
+    if (snprintf(track_path, sizeof(track_path), "%s/%s", config.download_dir, track_name) >= (int)sizeof(track_path)) {
+        fprintf(stderr, "Tracker path is too long.\n");
+        return;
+    }
+    track = fopen(track_path, "r");
+    if (track == NULL) {
+        perror(track_path);
+        return;
+    }
+
+    while (fgets(line, sizeof(line), track) != NULL) {
+        sscanf(line, "Filename: %255s", output_name);
+        sscanf(line, "Filesize: %llu", &file_size);
+        sscanf(line, "MD5: %32s", md5);
+    }
+    rewind(track);
+
+    if (!safe_filename(output_name) || file_size == 0 || !valid_md5(md5)) {
+        fprintf(stderr, "Invalid tracker metadata in %s.\n", track_path);
+        fclose(track);
+        return;
+    }
+
+    while (fgets(line, sizeof(line), track) != NULL) {
+        char peer_ip[64];
+        unsigned int peer_port;
+        unsigned long long start_bytes;
+        unsigned long long end_bytes;
+        unsigned long long timestamp;
+        if (sscanf(line, "%63[^:]:%u:%llu:%llu:%llu", peer_ip, &peer_port,
+                   &start_bytes, &end_bytes, &timestamp) != 5) {
+            continue;
+        }
+        (void)start_bytes;
+        (void)end_bytes;
+        (void)timestamp;
+
+        if (snprintf(output_path, sizeof(output_path), "%s/%s", config.download_dir,
+                     output_name) >= (int)sizeof(output_path)) {
+            fprintf(stderr, "Download path is too long.\n");
+            break;
+        }
+        dl_options options = {0};
+        char error[256];
+        options.host = peer_ip;
+        options.port = (uint16_t)peer_port;
+        options.remote_name = output_name;
+        options.output_path = output_path;
+        options.file_size = file_size;
+        options.chunk_size = 64 * 1024;
+
+        if (dl_download(&options, error, sizeof(error)) == 0) {
+            if (protocol_md5_file(output_path, local_md5) == 0 &&
+                ensure_md5_casefold_equal(local_md5, md5)) {
+                printf("Downloaded %s (MD5 verified: %s)\n", output_path, local_md5);
+            } else {
+                fprintf(stderr, "Downloaded file MD5 mismatch or unreadable: %s\n", output_path);
+                unlink(output_path);
+            }
+            fclose(track);
+            return;
+        }
+        fprintf(stderr, "Peer %s:%u failed: %s\n", peer_ip, peer_port, error);
+    }
+
+    fclose(track);
+    fprintf(stderr, "Could not download %s from any peer in %s.\n", output_name, track_path);
+}
+
 int main(int argc, char **argv)
 {
     const char *config_path = argc > 1 ? argv[1] : "clientThreadConfig.cfg";
@@ -562,6 +664,7 @@ int main(int argc, char **argv)
                "2) updatetracker\n"
                "3) LIST\n"
                "4) GET tracker file\n"
+               "5) DOWNLOAD peer data\n"
                "0) Quit\n", config.peer_port);
         if (read_prompt("Choice: ", choice, sizeof(choice)) != 0) {
             break;
@@ -574,10 +677,12 @@ int main(int argc, char **argv)
             command_list();
         } else if (strcmp(choice, "4") == 0) {
             command_get();
+        } else if (strcmp(choice, "5") == 0) {
+            command_download_peer();
         } else if (strcmp(choice, "0") == 0) {
             break;
         } else {
-            printf("Choose 0, 1, 2, 3, or 4.\n");
+            printf("Choose 0, 1, 2, 3, 4, or 5.\n");
         }
     }
 
