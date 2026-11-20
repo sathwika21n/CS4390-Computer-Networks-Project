@@ -180,8 +180,8 @@ stop_peer() {
 
 echo "=== t = 0s: Starting Tracker Server, Peer1 (small file), and Peer2 (large file) ==="
 # ./tracker > "$DEMO_ROOT/tracker.log" 2>&1 &
-TRACKER_PID=$!
-PIDS+=("$TRACKER_PID")
+# TRACKER_PID=$!
+# PIDS+=("$TRACKER_PID")
 sleep 1
 
 launch_peer "Peer1" "peer1" 9101 "1\n${SMALL_FILE}\nSmall_Demo_File\n"
@@ -215,4 +215,5 @@ stop_peer "peer1"
 stop_peer "peer2"
 
 echo "=== Demo timeline active. Logs are in $DEMO_ROOT/. Press Ctrl+C to stop remaining processes. ==="
+wait
 # wait "$TRACKER_PID"
