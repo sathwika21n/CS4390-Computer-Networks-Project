@@ -3,9 +3,10 @@ set -u
 
 TORRENTS_DIR="torrents"
 DEMO_ROOT="demo_runtime"
+BASE_CLIENT_CFG="${CLIENT_CFG:-clientThreadConfig.cfg}"
 
 TRACKER_HOST="127.0.0.1"
-TRACKER_PORT="9000"
+TRACKER_PORT="3490"
 PEER_IP="127.0.0.1"
 UPDATE_INTERVAL="15"
 
@@ -13,6 +14,52 @@ SMALL_FILE="small.bin"
 LARGE_FILE="large.bin"
 
 PIDS=()
+
+trim_whitespace() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+load_client_thread_config() {
+    local cfg_path="$1"
+    if [ ! -f "$cfg_path" ]; then
+        echo "Error: config file not found: $cfg_path" >&2
+        exit 1
+    fi
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        line="$(trim_whitespace "$line")"
+        [ -z "$line" ] && continue
+
+        case "$line" in
+            *=*)
+                local key="${line%%=*}"
+                local val="${line#*=}"
+                key="$(trim_whitespace "$key")"
+                val="$(trim_whitespace "$val")"
+                case "$key" in
+                    tracker_host)
+                        [ -n "$val" ] && TRACKER_HOST="$val"
+                        ;;
+                    tracker_port)
+                        [ -n "$val" ] && TRACKER_PORT="$val"
+                        ;;
+                    peer_ip)
+                        [ -n "$val" ] && PEER_IP="$val"
+                        ;;
+                    update_interval)
+                        [ -n "$val" ] && UPDATE_INTERVAL="$val"
+                        ;;
+                esac
+                ;;
+        esac
+    done < "$cfg_path"
+}
+
+load_client_thread_config "$BASE_CLIENT_CFG"
 
 cleanup() {
     echo ""
