@@ -201,7 +201,7 @@ for i in $(seq 3 8); do
 done
 
 echo "=== Waiting 60s (total 1m 30s) before starting Peers 9 to 13 and stopping Peers 1 & 2 ==="
-sleep 50
+sleep 50 
 
 echo "=== ~t = 80s: Quick download progress check (Peers 3 to 8) ==="
 for i in $(seq 3 8); do
@@ -214,6 +214,13 @@ for i in $(seq 3 8); do
 done
 
 sleep 10
+
+echo "=== t = 1m 30s: Starting Peers 9 to 13 ==="
+for i in $(seq 9 13); do
+    cmds="3\n4\n${SMALL_FILE}.track\n4\n${LARGE_FILE}.track\n"
+    launch_peer "Peer${i}" "peer${i}" "$((9100 + i))" "$cmds"
+    echo "Peer${i}: List & Get ${SMALL_FILE}.track, ${LARGE_FILE}.track"
+done
 
 echo "=== t = 1m 30s: Stopping Peer1 and Peer2 ==="
 stop_peer "peer1"
