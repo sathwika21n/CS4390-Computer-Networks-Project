@@ -201,14 +201,19 @@ for i in $(seq 3 8); do
 done
 
 echo "=== Waiting 60s (total 1m 30s) before starting Peers 9 to 13 and stopping Peers 1 & 2 ==="
-sleep 60
+sleep 50
 
-echo "=== t = 1m 30s: Starting Peers 9 to 13 ==="
-for i in $(seq 9 13); do
-    cmds="3\n4\n${SMALL_FILE}.track\n4\n${LARGE_FILE}.track\n"
-    launch_peer "Peer${i}" "peer${i}" "$((9100 + i))" "$cmds"
-    echo "Peer${i}: List & Get ${SMALL_FILE}.track, ${LARGE_FILE}.track"
+echo "=== ~t = 80s: Quick download progress check (Peers 3 to 8) ==="
+for i in $(seq 3 8); do
+    dl_dir="$DEMO_ROOT/peer${i}/downloads"
+    log_file="$DEMO_ROOT/peer${i}/client.log"
+    small_sz=$(stat -c%s "$dl_dir/$SMALL_FILE" 2>/dev/null || echo 0)
+    large_sz=$(stat -c%s "$dl_dir/$LARGE_FILE" 2>/dev/null || echo 0)
+    last_line=$(tail -n 1 "$log_file" 2>/dev/null || true)
+    echo "Peer${i}: small=${small_sz}/${SMALL_BYTES}B, large=${large_sz}/${LARGE_BYTES}B | last: ${last_line}"
 done
+
+sleep 10
 
 echo "=== t = 1m 30s: Stopping Peer1 and Peer2 ==="
 stop_peer "peer1"
