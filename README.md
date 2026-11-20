@@ -1,5 +1,17 @@
 # CS4390-Computer-Networks-Project
 
+Check out [the project outline](https://docs.google.com/document/d/1LWsZo2D4uYXuAwpFO6OcWllf97uuh9ZKTnB6c/edit?usp=sharing).
+
+A team peer-to-peer file-sharing project organized around a tracker, peer client,
+peer server, and downloader.
+
+## Team responsibilities
+
+- Jazminee: tracker service.
+- Sathwika: tracker-facing client, metadata/menu integration, and peer updates.
+- Kriti: peer server and checksum utilities.
+- Veda: TCP downloader, segmentation, chunk requests, and file reconstruction.
+
 ## Peer client (midterm scope)
 
 The peer client implements the peer-to-tracker `createtracker`, `updatetracker`,
@@ -10,19 +22,12 @@ periodically publishes the full byte range of regular files in the shared folder
 
 ### Build
 
-On macOS:
-
 ```sh
-cc -std=c11 -Wall -Wextra -Wpedantic -pthread peer_client.c protocol.c -o peer_client
+make
 ```
 
-On Linux with OpenSSL development headers installed:
-
-```sh
-cc -std=c11 -Wall -Wextra -Wpedantic -pthread peer_client.c protocol.c -lcrypto -o peer_client
-```
-
-Run the protocol/parser and MD5 checks with:
+On macOS, the Makefile builds the tracker, peer client, and peer server. Run the
+protocol/parser and MD5 checks with:
 
 ```sh
 cc -std=c11 -Wall -Wextra -Wpedantic test_protocol.c protocol.c -o test_protocol && ./test_protocol
@@ -30,12 +35,12 @@ cc -std=c11 -Wall -Wextra -Wpedantic test_protocol.c protocol.c -o test_protocol
 
 ### Configure and run
 
-Edit [clientThreadConfig.cfg](clientThreadConfig.cfg) on each machine:
+Edit `clientThreadConfig.cfg` on each machine:
 
 - `tracker_host` and `tracker_port` must match the tracker server's `sconfig`.
-- `peer_ip` must be this peer's reachable LAN address, not `127.0.0.1`, for a
-	two-machine demo.
-- `peer_port` is the peer listener port; this project is using `3490`.
+- `peer_ip` must be this peer's reachable LAN address, not `127.0.0.1`, for a	two-machine demo.
+- `peer_port` is the peer listener port; this project uses `3490` for the peer
+	client configuration.
 - `shared_dir` contains files that can be registered and advertised.
 - `download_dir` receives verified tracker files.
 
@@ -44,32 +49,38 @@ menu. `createtracker` accepts a one-token description because the specified
 wire format has no quoting/escaping for spaces. Tracker filenames and shared
 filenames likewise must not contain whitespace.
 
-The client sends one request per TCP connection. The tracker implementation
-must use the matching formats in [protocol.h](protocol.h); peer file serving
-and actual peer-to-peer file downloads are implemented by the other assigned
-components, not this tracker client.
+The peer client sends one request per TCP connection. The tracker implementation
+handles matching `createtracker`, `updatetracker`, `LIST`, and `GET` formats.
 
-## What to complete next
+## Downloader progress
 
-Work through these steps in order to finish and demonstrate the full project:
+The downloader connects to one TCP peer, requests file ranges sequentially,
+receives binary chunks, and writes them at their correct offsets. It is blocking
+and single-threaded. Multiple-peer selection, concurrency, resume, and tracker-
+integrated peer selection remain future work.
 
-1. **Finish and verify the tracker server.** Implement the matching request and
-	response formats in [protocol.h](protocol.h) for `createtracker`,
-	`updatetracker`, `LIST`, and `GET`. Confirm that it accepts one request per
-	TCP connection and that the client can use it from another machine.
-2. **Implement peer file serving.** Add a listener on the configured
-	`peer_ip:peer_port` that accepts peer requests and sends the requested byte
-	ranges from regular files in `shared_dir`. Handle invalid filenames,
-	unavailable files, and invalid ranges without crashing.
-3. **Implement actual peer-to-peer downloads.** Use tracker results to locate
-	peers, request file data from them, and save/reassemble the received bytes.
-	Keep this separate from the current `GET` menu action, which downloads a
-	`.track` metadata file from the tracker only.
-4. **Test the complete flow with two peers.** Create metadata, publish each
-	peer's available byte range, list files, download a file from the other
-	peer, and compare the completed file's size and MD5 with the source. Also
-	test missing files, bad ranges, interrupted connections, and empty files.
-5. **Prepare the demo and submission.** Set each machine's tracker address and
-	reachable peer IP in its config, build and run the protocol tests, record
-	the exact demo steps, and document any known limitations or unfinished
-	requirements.
+## Test the downloader
+
+In Linux or Ubuntu/WSL, from the repository root:
+
+```sh
+gcc -std=c11 -Wall -Wextra -Wpedantic -Werror downloader.c tests/downloader_cli.c -o tests/downloader_cli
+python3 tests/test_downloader.py
+```
+
+PowerShell users can prefix each command with `wsl -d Ubuntu --`. Requires GCC,
+POSIX development headers, and Python 3. Tests use a local mock peer, not the
+team's actual peer server.
+
+See [DOWNLOADER.md](DOWNLOADER.md) for architecture, API/function explanations,
+manual transfer instructions, limitations, and remaining integration work.
+
+## Remaining integration work
+
+1. Align the peer server's shared directory and port with the peer client and
+	tracker configuration.
+2. Integrate tracker peer listings with the downloader for peer selection.
+3. Add actual peer-to-peer download menu actions and MD5 verification of the
+	completed source file.
+4. Test the complete two-peer flow, including missing files, invalid ranges,
+	interrupted connections, and empty files.

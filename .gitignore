@@ -1,0 +1,4 @@
+tests/downloader_cli
+tests/__pycache__/
+.test-tools/
+backups/
