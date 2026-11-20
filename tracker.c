@@ -18,10 +18,11 @@
 #include <unistd.h>
 
 #define MAX_THREADS 100
-#define TRACKER_TIMEOUT_SECONDS 900 /* Peer refresh defaults to 15 minutes. */
 
 static unsigned short tracker_port;
 static char shared_dir[256];
+/* A peer is dead once it misses this many seconds of updates (sconfig line 3, default 15 min). */
+static long dead_peer_seconds = 900;
 static pthread_mutex_t file_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t thread_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t thread_cond = PTHREAD_COND_INITIALIZER;
@@ -34,6 +35,11 @@ static void read_config(void) {
     if (fscanf(f, "%u", &p) != 1 || p == 0 || p > 65535 ||
         fscanf(f, "%255s", shared_dir) != 1) {
         fprintf(stderr, "Invalid sconfig (expected port and tracker directory)\n");
+        fclose(f);
+        exit(EXIT_FAILURE);
+    }
+    if (fscanf(f, "%ld", &dead_peer_seconds) == 1 && dead_peer_seconds <= 0) {
+        fprintf(stderr, "Invalid sconfig dead-peer timeout\n");
         fclose(f);
         exit(EXIT_FAILURE);
     }
@@ -61,6 +67,12 @@ static int valid_name(const char *s) {
     return 1;
 }
 
+/* Peer lines are ip:port:..., so only a plain IPv4 address keeps the format parseable. */
+static int valid_ip(const char *s) {
+    struct in_addr a;
+    return inet_pton(AF_INET, s, &a) == 1;
+}
+
 static int tracker_path(char *path, size_t cap, const char *filename) {
     if (!valid_name(filename)) return -1;
     int n = snprintf(path, cap, "%s/%s.track", shared_dir, filename);
@@ -77,8 +89,8 @@ static int is_peer_entry(const char *line, char *ip, size_t ip_cap,
                          unsigned long long *end, long long *stamp) {
     char parsed_ip[64], extra;
     if (sscanf(line, "%63[^:]:%u:%llu:%llu:%lld %c", parsed_ip,
-               port, start, end, stamp, &extra) != 5) return 0;
-    if (strlen(parsed_ip) >= ip_cap) return 0;
+               port, &start, &end, stamp, &extra) != 5) return 0;
+    if (strlen(parsed_ip) >= ip_cap || !valid_ip(parsed_ip)) return 0;
     strcpy(ip, parsed_ip);
     return 1;
 }
@@ -111,7 +123,7 @@ static void reply_update(int fd, const char *name, const char *status) {
 
 static void handle_create(int fd, const protocol_request_t *req) {
     char path[600];
-    if (tracker_path(path, sizeof(path), req->filename) != 0) {
+    if (tracker_path(path, sizeof(path), req->filename) != 0 || !valid_ip(req->ip_address)) {
         reply_create(fd, "fail");
         return;
     }
@@ -144,7 +156,7 @@ static void handle_create(int fd, const protocol_request_t *req) {
    A temporary file and rename prevent readers from seeing a half-written tracker. */
 static void handle_update(int fd, const protocol_request_t *req) {
     char path[600];
-    if (tracker_path(path, sizeof(path), req->filename) != 0) {
+    if (tracker_path(path, sizeof(path), req->filename) != 0 || !valid_ip(req->ip_address)) {
         reply_update(fd, req->filename, "fail");
         return;
     }
@@ -192,12 +204,10 @@ static void handle_update(int fd, const protocol_request_t *req) {
         unsigned int p = 0;
         unsigned long long first, end;
         long long timestamp = 0;
-        if (is_peer_entry(line, ip, sizeof(ip), &p, &first, &end, &timestamp)) {
-            if (!filesize) continue;
-            if (timestamp <= 0 || (long long)now - timestamp > TRACKER_TIMEOUT_SECONDS) continue;
-            if (filesize && end == (uint64_t)filesize) --end;
-            if (!strcmp(ip, req->ip_address) && p == req->port &&
-                req->start_bytes <= first && last >= end) continue;
+        if (is_peer_entry(line, ip, sizeof(ip), &p, &timestamp)) {
+            /* The requesting peer gets a fresh entry below. */
+            if (strcmp(ip, req->ip_address) == 0 && p == req->port) continue;
+            if (timestamp <= 0 || (long long)now - timestamp > dead_peer_seconds) continue;
         }
         if (fputs(line, dst) == EOF) { ok = 0; break; }
     }
@@ -359,7 +369,8 @@ int main(void) {
         close(listener);
         return EXIT_FAILURE;
     }
-    printf("Tracker listening on port %u (dir: %s)\n", tracker_port, shared_dir);
+    printf("Tracker listening on port %u (dir: %s, dead peer after %lds)\n",
+           tracker_port, shared_dir, dead_peer_seconds);
     fflush(stdout);
     for (;;) {
         pthread_mutex_lock(&thread_lock);
