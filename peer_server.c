@@ -58,16 +58,24 @@ void *handle_peer_request(void *client_socket_ptr) {
     const struct timeval timeout = {3, 0};
     setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(client_sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    char filename[256], offset_text[21], length_text[21], extra;
+    char filename[256], offset_text[21], length_text[MAX_REQUEST_SIZE + 1], extra;
     uintmax_t offset, length;
 
     if (!read_request(client_sock, buffer) &&
-        sscanf(buffer, "GET_CHUNK %255s %20s %20s %c", filename, offset_text,
+        sscanf(buffer, "GET_CHUNK %255s %20s %1024s %c", filename, offset_text,
                length_text, &extra) == 3 &&
         !strchr(filename, '/') && !strchr(filename, '\\') &&
         strcmp(filename, ".") && strcmp(filename, "..") &&
         !parse_decimal(offset_text, LONG_MAX, &offset) &&
-        !parse_decimal(length_text, MAX_CHUNK_SIZE, &length) && length) {
+        length_text[strspn(length_text, "0123456789")] == '\0' &&
+        (length = strtoumax(length_text, NULL, 10)) != 0) {
+        /* An overflowing decimal length saturates and is also oversized. */
+        if (length > MAX_CHUNK_SIZE) {
+            const char invalid[] = "<GET invalid>\n";
+            send_all(client_sock, invalid, sizeof(invalid) - 1);
+            close(client_sock);
+            return NULL;
+        }
         char file_path[512];
         snprintf(file_path, sizeof(file_path), "./shared_files/%s", filename);
 
