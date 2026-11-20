@@ -121,6 +121,24 @@ update_interval=${UPDATE_INTERVAL}
 EOF
 }
 
+start_log_prefixer() {
+    local label="$1"
+    local log_file="$2"
+
+    : > "$log_file"
+    {
+        tail -n +1 -F "$log_file" 2>/dev/null | while IFS= read -r line; do
+            case "$line" in
+                "Peer client ("* | "1) createtracker"* | "2) updatetracker"* | "3) LIST"* | "4) GET tracker file"* | "0) Quit"* | "Choice:"*)
+                    continue
+                    ;;
+            esac
+            printf "%s: %s\n" "$label" "$line"
+        done
+    } &
+    printf '%s' "$!"
+}
+
 launch_peer() {
     local label="$1"
     local peer_name="$2"
@@ -129,10 +147,15 @@ launch_peer() {
 
     local peer_dir="$DEMO_ROOT/$peer_name"
     local fifo="$peer_dir/cmd.fifo"
+    local client_log="$peer_dir/client.log"
 
     write_peer_configs "$peer_name" "$peer_port"
     rm -f "$fifo"
     mkfifo "$fifo"
+
+    local log_pid
+    log_pid="$(start_log_prefixer "$label" "$client_log")"
+    PIDS+=("$log_pid")
 
     ./peer_server "$peer_dir/serverThreadConfig.cfg" > "$peer_dir/server.log" 2>&1 &
     local srv_pid=$!
@@ -145,13 +168,14 @@ launch_peer() {
     local feeder_pid=$!
     PIDS+=("$feeder_pid")
 
-    ./peer_client "$peer_dir/clientThreadConfig.cfg" < "$fifo" > "$peer_dir/client.log" 2>&1 &
+    ./peer_client "$peer_dir/clientThreadConfig.cfg" < "$fifo" > "$client_log" 2>&1 &
     local cli_pid=$!
     PIDS+=("$cli_pid")
 
     eval "${peer_name}_SRV_PID=$srv_pid"
     eval "${peer_name}_CLI_PID=$cli_pid"
     eval "${peer_name}_FEEDER_PID=$feeder_pid"
+    eval "${peer_name}_LOG_PID=$log_pid"
     eval "${peer_name}_LABEL=$label"
 }
 
@@ -160,11 +184,13 @@ stop_peer() {
     local srv_var="${peer_name}_SRV_PID"
     local cli_var="${peer_name}_CLI_PID"
     local feeder_var="${peer_name}_FEEDER_PID"
+    local log_var="${peer_name}_LOG_PID"
     local label_var="${peer_name}_LABEL"
 
     local srv_pid="${!srv_var:-}"
     local cli_pid="${!cli_var:-}"
     local feeder_pid="${!feeder_var:-}"
+    local log_pid="${!log_var:-}"
     local label="${!label_var:-$peer_name}"
 
     [ -n "$feeder_pid" ] && kill "$feeder_pid" 2>/dev/null || true
@@ -174,6 +200,10 @@ stop_peer() {
     [ -n "$feeder_pid" ] && wait "$feeder_pid" 2>/dev/null || true
     [ -n "$cli_pid" ] && wait "$cli_pid" 2>/dev/null || true
     [ -n "$srv_pid" ] && wait "$srv_pid" 2>/dev/null || true
+
+    sleep 0.2
+    [ -n "$log_pid" ] && kill "$log_pid" 2>/dev/null || true
+    [ -n "$log_pid" ] && wait "$log_pid" 2>/dev/null || true
 
     echo "${label} terminated"
 }
@@ -201,7 +231,7 @@ for i in $(seq 3 8); do
 done
 
 echo "=== Waiting 60s (total 1m 30s) before starting Peers 9 to 13 and stopping Peers 1 & 2 ==="
-sleep 50 
+sleep 50
 
 echo "=== ~t = 80s: Quick download progress check (Peers 3 to 8) ==="
 for i in $(seq 3 8); do
