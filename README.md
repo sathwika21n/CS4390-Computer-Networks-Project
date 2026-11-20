@@ -48,3 +48,28 @@ The client sends one request per TCP connection. The tracker implementation
 must use the matching formats in [protocol.h](protocol.h); peer file serving
 and actual peer-to-peer file downloads are implemented by the other assigned
 components, not this tracker client.
+
+## What to complete next
+
+Work through these steps in order to finish and demonstrate the full project:
+
+1. **Finish and verify the tracker server.** Implement the matching request and
+	response formats in [protocol.h](protocol.h) for `createtracker`,
+	`updatetracker`, `LIST`, and `GET`. Confirm that it accepts one request per
+	TCP connection and that the client can use it from another machine.
+2. **Implement peer file serving.** Add a listener on the configured
+	`peer_ip:peer_port` that accepts peer requests and sends the requested byte
+	ranges from regular files in `shared_dir`. Handle invalid filenames,
+	unavailable files, and invalid ranges without crashing.
+3. **Implement actual peer-to-peer downloads.** Use tracker results to locate
+	peers, request file data from them, and save/reassemble the received bytes.
+	Keep this separate from the current `GET` menu action, which downloads a
+	`.track` metadata file from the tracker only.
+4. **Test the complete flow with two peers.** Create metadata, publish each
+	peer's available byte range, list files, download a file from the other
+	peer, and compare the completed file's size and MD5 with the source. Also
+	test missing files, bad ranges, interrupted connections, and empty files.
+5. **Prepare the demo and submission.** Set each machine's tracker address and
+	reachable peer IP in its config, build and run the protocol tests, record
+	the exact demo steps, and document any known limitations or unfinished
+	requirements.
