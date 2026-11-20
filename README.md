@@ -2,6 +2,10 @@
 
 [Project outline](https://docs.google.com/document/d/1LWsZo2D4uYXuAwpFO6OcWllf97uuh9KJos3dZKTnB6c/edit?usp=sharing)
 
+Currently, the clientThreadConfig.cfg is configured to have tracker run on csa-linux02.utdallas.edu at port 3490.
+Please update this file to match which server you want tracker to run.
+start_demo.sh contains a way to run everything in one server, as it falls back to starting its own tracker if there is no tracker at the configured location. Please uncomment the lines containing `TRACKER` that are commented to make it work in that format.
+
 This project shares files between peers using a tracker, peer client, peer
 server and downloader. Build on Linux or Ubuntu WSL with `make clean && make` after
 installing the OpenSSL development headers.
