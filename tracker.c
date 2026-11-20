@@ -89,7 +89,7 @@ static int is_peer_entry(const char *line, char *ip, size_t ip_cap,
                          unsigned long long *end, long long *stamp) {
     char parsed_ip[64], extra;
     if (sscanf(line, "%63[^:]:%u:%llu:%llu:%lld %c", parsed_ip,
-               port, &start, &end, stamp, &extra) != 5) return 0;
+               port, start, end, stamp, &extra) != 5) return 0;
     if (strlen(parsed_ip) >= ip_cap || !valid_ip(parsed_ip)) return 0;
     strcpy(ip, parsed_ip);
     return 1;
@@ -204,7 +204,7 @@ static void handle_update(int fd, const protocol_request_t *req) {
         unsigned int p = 0;
         unsigned long long first, end;
         long long timestamp = 0;
-        if (is_peer_entry(line, ip, sizeof(ip), &p, &timestamp)) {
+        if (is_peer_entry(line, ip, sizeof(ip), &p, &first, &end, &timestamp)) {
             /* The requesting peer gets a fresh entry below. */
             if (strcmp(ip, req->ip_address) == 0 && p == req->port) continue;
             if (timestamp <= 0 || (long long)now - timestamp > dead_peer_seconds) continue;
