@@ -175,7 +175,7 @@ typedef struct {
     char host[INET_ADDRSTRLEN];
     uint16_t port;
     uint64_t start, end, timestamp;
-    unsigned active;
+    size_t endpoint;
 } dl_peer;
 
 typedef struct {
@@ -213,12 +213,17 @@ static int parse_peer(const char *line, dl_peer *peer) {
     return 0;
 }
 
-static int compare_peers(const void *left, const void *right) {
+static int compare_endpoints(const void *left, const void *right) {
     const dl_peer *a = left, *b = right;
-    if (a->timestamp != b->timestamp) return a->timestamp > b->timestamp ? -1 : 1;
     int host_order = strcmp(a->host, b->host);
     if (host_order) return host_order;
     return (a->port > b->port) - (a->port < b->port);
+}
+
+static int compare_peers(const void *left, const void *right) {
+    const dl_peer *a = left, *b = right;
+    if (a->timestamp != b->timestamp) return a->timestamp > b->timestamp ? -1 : 1;
+    return compare_endpoints(left, right);
 }
 
 static int track_name_valid(const char *name) {
@@ -281,7 +286,15 @@ static int read_track(const char *path, track_file *track) {
         dl_peer *peer = &track->peers[i];
         peer->end = peer->end < track->size ? peer->end + 1 : track->size;
     }
-    if (track->count > 1) qsort(track->peers, track->count, sizeof(dl_peer), compare_peers);
+    if (track->count > 1) {
+        /* Multiple range rows for one IP and port share one activity counter. */
+        qsort(track->peers, track->count, sizeof(dl_peer), compare_endpoints);
+        for (size_t i = 1; i < track->count; ++i) {
+            dl_peer *previous = &track->peers[i - 1], *current = &track->peers[i];
+            current->endpoint = previous->endpoint + (compare_endpoints(previous, current) != 0);
+        }
+        qsort(track->peers, track->count, sizeof(dl_peer), compare_peers);
+    }
     result = 0;
 done:
     free(line);
@@ -294,6 +307,7 @@ enum { MAP_HEADER_SIZE = 64 };
 typedef struct {
     track_file *track;
     int part_fd, map_fd;
+    unsigned *active;
     uint64_t next, slots, failures;
     pthread_mutex_t mutex;
 } download_job;
@@ -316,12 +330,12 @@ static size_t reserve_peer(download_job *job, uint64_t start, uint64_t end) {
         dl_peer *peer = &job->track->peers[i];
         if (!covers(peer, start, end)) continue;
         if (first == job->track->count) first = i;
-        if (!peer->active) {
+        if (!job->active[peer->endpoint]) {
             first = i;
             break;
         }
     }
-    if (first < job->track->count) ++job->track->peers[first].active;
+    if (first < job->track->count) ++job->active[job->track->peers[first].endpoint];
     pthread_mutex_unlock(&job->mutex);
     return first;
 }
@@ -335,7 +349,7 @@ static int try_peer(const worker_args *worker, dl_peer *peer, uint64_t start,
     const char *error = fetch_chunk(peer->host, peer->port, job->track->name,
                                     start, length, buffer, 1);
     pthread_mutex_lock(&job->mutex);
-    --peer->active;
+    --job->active[peer->endpoint];
     pthread_mutex_unlock(&job->mutex);
     if (!error) return 0;
     fprintf(stderr, "[Downloader worker %u] %s:%u offset=%" PRIu64
@@ -362,7 +376,7 @@ static int fetch_range(const worker_args *worker, uint64_t start, uint64_t end,
         }
         if (i == first) continue;
         pthread_mutex_lock(&job->mutex);
-        ++peer->active;
+        ++job->active[peer->endpoint];
         pthread_mutex_unlock(&job->mutex);
         if (!try_peer(worker, peer, start, length, buffer)) return 0;
     }
@@ -586,6 +600,13 @@ static const char *download_track(const char *directory, const char *shared, tra
     } else {
         error = "Cannot prepare resumable download";
         if (errno != ENOENT || prepare_state(&job, dir)) goto done;
+        if (job.slots && track->count) {
+            job.active = calloc(track->count, sizeof(*job.active));
+            if (!job.active) {
+                error = "Cannot allocate peer activity counters";
+                goto done;
+            }
+        }
         fprintf(stderr, "[Downloader] Requesting %s (%" PRIu64 " bytes)\n", track->name, track->size);
         run_workers(&job);
         error = "Download incomplete; GET the tracker again to resume";
@@ -614,6 +635,7 @@ static const char *download_track(const char *directory, const char *shared, tra
     fprintf(stderr, "[Downloader] Complete %s (MD5 verified: %s)\n", output, track->md5);
     error = NULL;
 done:
+    free(job.active);
     if (job.part_fd >= 0) close(job.part_fd);
     if (job.map_fd >= 0) close(job.map_fd);
     if (dir >= 0) close(dir);
