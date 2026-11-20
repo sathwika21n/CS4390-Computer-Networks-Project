@@ -9,10 +9,47 @@
 #include <limits.h>
 #include <sys/time.h>
 #include "utils.h"
+#include "downloader.h"
 
 #define PORT 9001
 #define MAX_REQUEST_SIZE 1024
 #define MAX_CHUNK_SIZE 1024
+
+static unsigned short listen_port = PORT;
+static char shared_directory[512] = "./shared_files";
+static char download_directory[512] = "./downloads";
+
+static int parse_decimal(const char *text, uintmax_t max, uintmax_t *result);
+
+static int load_server_config(const char *path, int required) {
+    FILE *file = fopen(path, "r");
+    if (!file) return !required && errno == ENOENT ? 0 : -1;
+    char line[1024];
+    int result = 0;
+    while (fgets(line, sizeof(line), file)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        char *value = strchr(line, '=');
+        if (!value || line[0] == '#') continue;
+        *value++ = '\0';
+        if (!strcmp(line, "PORT")) {
+            uintmax_t port;
+            if (parse_decimal(value, UINT16_MAX, &port) || !port) {
+                result = -1;
+                break;
+            }
+            listen_port = (unsigned short)port;
+        } else if (!strcmp(line, "SHARED_DIR") || !strcmp(line, "DOWNLOAD_DIR")) {
+            if (!*value || strlen(value) >= sizeof(shared_directory)) {
+                result = -1;
+                break;
+            }
+            strcpy(!strcmp(line, "SHARED_DIR") ? shared_directory : download_directory, value);
+        }
+    }
+    if (ferror(file)) result = -1;
+    fclose(file);
+    return result;
+}
 
 static int send_all(int fd, const char *data, size_t length) {
     while (length) {
@@ -76,11 +113,14 @@ void *handle_peer_request(void *client_socket_ptr) {
             close(client_sock);
             return NULL;
         }
-        char file_path[512];
-        snprintf(file_path, sizeof(file_path), "./shared_files/%s", filename);
+        char file_path[1024];
+        snprintf(file_path, sizeof(file_path), "%s/%s", shared_directory, filename);
 
         char chunk_buffer[MAX_CHUNK_SIZE];
         int bytes_read = readChunk(file_path, (long)offset, chunk_buffer, (size_t)length);
+        if (bytes_read != (int)length &&
+            !dl_read_partial(download_directory, filename, offset, chunk_buffer, (size_t)length))
+            bytes_read = (int)length;
         if (bytes_read == (int)length) {
             char header[80];
             int hdr_len = snprintf(header, sizeof(header), "CHUNK %d\n", bytes_read);
@@ -99,13 +139,17 @@ void *handle_peer_request(void *client_socket_ptr) {
     return NULL;
 }
 
-int main() {
+int main(int argc, char **argv) {
+    if (argc > 2 || load_server_config(argc == 2 ? argv[1] : "serverThreadConfig.cfg", argc == 2)) {
+        fprintf(stderr, "Usage: %s [valid serverThreadConfig.cfg]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
     int server_sock;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
 
     // Ensure shared folder exists
-    initSharedFolder("./shared_files");
+    initSharedFolder(shared_directory);
 
     server_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (server_sock < 0) {
@@ -118,7 +162,7 @@ int main() {
 
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
+    server_addr.sin_port = htons(listen_port);
 
     if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("Bind failed");
@@ -132,7 +176,7 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    printf("[PeerServer] Running and listening on port %d...\n", PORT);
+    printf("[PeerServer] Running and listening on port %u...\n", (unsigned)listen_port);
 
     while (1) {
         int *new_sock = malloc(sizeof(int));

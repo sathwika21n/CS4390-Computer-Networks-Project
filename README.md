@@ -8,15 +8,17 @@ installing the OpenSSL development headers.
 
 The peer client supports `createtracker`, `updatetracker`, `LIST` and `GET`.
 GET verifies the returned tracker metadata and automatically downloads the
-file from peers. A background thread periodically advertises regular files
-in the configured shared folder. Tracker filenames, shared filenames and
+file from peers. Peers advertise and serve durably completed segments during
+downloads. The client resumes cached jobs at startup and refreshes metadata
+for incomplete jobs at its configured interval. Tracker filenames, shared filenames and
 descriptions use single protocol tokens.
 
 Run `./tracker` with `sconfig` on the tracker host, `./peer_server` on serving
 peers and `./peer_client clientThreadConfig.cfg` to access the menu. The
-tracker defaults to TCP 3490 and the peer server serves `./shared_files` on
-TCP 9001. Set the tracker and peer IP addresses in `clientThreadConfig.cfg`
-before running across machines.
+tracker defaults to TCP 3490 and the peer server normally serves
+`./shared_files` on TCP 9001. Set the tracker and peer IP addresses in
+`clientThreadConfig.cfg` and match its peer port and directories with
+`serverThreadConfig.cfg` before running across machines.
 
 See [DOWNLOADER.md](DOWNLOADER.md) for build and test commands, resume behavior
 and the LAN demo.

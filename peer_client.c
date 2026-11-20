@@ -7,7 +7,9 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <signal.h>
@@ -16,6 +18,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -34,6 +37,8 @@ static client_config_t config;
 static pthread_mutex_t shutdown_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t shutdown_condition = PTHREAD_COND_INITIALIZER;
 static int shutting_down;
+static pthread_mutex_t downloads_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char metadata_directory[1024];
 
 static char *trim(char *text)
 {
@@ -73,7 +78,7 @@ static int load_config(const char *path)
         return -1;
     }
     memset(&config, 0, sizeof(config));
-    config.update_interval = 60;
+    config.update_interval = 900;
 
     while (fgets(line, sizeof(line), file) != NULL) {
         char *key = trim(line);
@@ -184,8 +189,22 @@ static int connect_tracker(void)
         if (socket_fd < 0) {
             continue;
         }
-        if (connect(socket_fd, address->ai_addr, address->ai_addrlen) == 0) {
-            break;
+        int flags = fcntl(socket_fd, F_GETFL);
+        if (flags >= 0 && !fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK)) {
+            int status = connect(socket_fd, address->ai_addr, address->ai_addrlen);
+            if (status < 0 && errno == EINPROGRESS) {
+                struct pollfd pending = {.fd = socket_fd, .events = POLLOUT};
+                int error;
+                socklen_t length = sizeof(error);
+                if (poll(&pending, 1, 2500) > 0 &&
+                    !getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &error, &length) && !error)
+                    status = 0;
+            }
+            const struct timeval timeout = {3, 0};
+            if (!status && !fcntl(socket_fd, F_SETFL, flags) &&
+                !setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) &&
+                !setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)))
+                break;
         }
         close(socket_fd);
         socket_fd = -1;
@@ -234,21 +253,16 @@ static int file_metadata(const char *filename, uint64_t *filesize,
     return 0;
 }
 
-static int update_one_file(const char *filename, int quiet)
+static int update_range(const char *filename, uint64_t first, uint64_t last, int quiet)
 {
-    char path[1024];
     char request[PROTOCOL_LINE_MAX];
     char response_line[PROTOCOL_LINE_MAX];
     protocol_response_t response;
-    uint64_t filesize;
     int socket_fd;
     int read_result;
 
-    if (file_metadata(filename, &filesize, NULL, path, sizeof(path)) != 0) {
-        return -1;
-    }
-    snprintf(request, sizeof(request), "<updatetracker %s 0 %llu %s %u>\n",
-             filename, (unsigned long long)(filesize == 0 ? 0 : filesize - 1),
+    snprintf(request, sizeof(request), "<updatetracker %s %llu %llu %s %u>\n",
+             filename, (unsigned long long)first, (unsigned long long)last,
              config.peer_ip, config.peer_port);
     socket_fd = connect_tracker();
     if (socket_fd < 0) {
@@ -271,6 +285,14 @@ static int update_one_file(const char *filename, int quiet)
         printf("updatetracker %s: %s\n", filename, response.status);
     }
     return strcmp(response.status, "succ") == 0 ? 0 : -1;
+}
+
+static int update_one_file(const char *filename, int quiet)
+{
+    char path[1024];
+    uint64_t filesize;
+    if (file_metadata(filename, &filesize, NULL, path, sizeof(path))) return -1;
+    return update_range(filename, 0, filesize ? filesize - 1 : 0, quiet);
 }
 
 static int read_prompt(const char *prompt, char *buffer, size_t size)
@@ -386,43 +408,34 @@ static int ensure_md5_casefold_equal(const char *left, const char *right)
     return strcasecmp(left, right) == 0;
 }
 
-static void command_get(void)
+static int cached_path(const char *filename, char *path, size_t size)
 {
-    char filename[PROTOCOL_NAME_MAX];
+    size_t length = strlen(filename);
+    return !safe_filename(filename) || length <= 6 || strcmp(filename + length - 6, ".track") ||
+           snprintf(path, size, "%s/%s", metadata_directory, filename) >= (int)size ? -1 : 0;
+}
+
+static int fetch_metadata(const char *filename, const char *output_path)
+{
     char request[PROTOCOL_LINE_MAX];
     char line[PROTOCOL_LINE_MAX];
-    char metadata_dir[1024];
-    char output_path[1024];
     char temporary_path[1100];
     char local_md5[PROTOCOL_MD5_HEX_LEN + 1];
     protocol_response_t response;
     FILE *output = NULL;
     int socket_fd = -1;
     int completed = 0;
+    int temporary_created = 0;
 
-    if (read_prompt("Tracker filename to GET (for example file.track): ", filename,
-                    sizeof(filename)) != 0 || !safe_filename(filename)) {
-        fprintf(stderr, "Invalid filename.\n");
-        return;
-    }
-    /* Keep verified tracker files out of the payload filename namespace. */
-    if (snprintf(metadata_dir, sizeof(metadata_dir), "%s/.trackers", config.download_dir)
-            >= (int)sizeof(metadata_dir) ||
-        snprintf(output_path, sizeof(output_path), "%s/%s", metadata_dir,
-                 filename) >= (int)sizeof(output_path) ||
-        snprintf(temporary_path, sizeof(temporary_path), "%s.part.%ld", output_path,
-                 (long)getpid()) >= (int)sizeof(temporary_path)) {
+    if (snprintf(temporary_path, sizeof(temporary_path), "%s.part.XXXXXX", output_path)
+            >= (int)sizeof(temporary_path)) {
         fprintf(stderr, "Download path is too long.\n");
-        return;
-    }
-    if (ensure_directory(metadata_dir) != 0) {
-        perror("Creating tracker metadata directory");
-        return;
+        return -1;
     }
     snprintf(request, sizeof(request), "<GET %s >\n", filename);
     socket_fd = connect_tracker();
     if (socket_fd < 0) {
-        return;
+        return -1;
     }
     if (protocol_send_line(socket_fd, request) != 0 ||
         protocol_read_line(socket_fd, line, sizeof(line)) != 1 ||
@@ -431,8 +444,16 @@ static void command_get(void)
         fprintf(stderr, "Invalid GET response.\n");
         goto cleanup;
     }
-    output = fopen(temporary_path, "wb");
+    int temporary_fd = mkstemp(temporary_path);
+    if (temporary_fd < 0) {
+        perror(temporary_path);
+        close(socket_fd);
+        return -1;
+    }
+    temporary_created = 1;
+    output = fdopen(temporary_fd, "wb");
     if (output == NULL) {
+        close(temporary_fd);
         perror(temporary_path);
         goto cleanup;
     }
@@ -480,23 +501,51 @@ static void command_get(void)
     }
     printf("Saved %s (MD5 verified: %s)\n", output_path, local_md5);
     completed = 1;
-    close(socket_fd);
-    socket_fd = -1;
-    char download_error[256];
-    if (dl_download_track(output_path, config.download_dir,
-                          download_error, sizeof(download_error)) != 0)
-        fprintf(stderr, "Peer download failed: %s\n", download_error);
 
 cleanup:
     if (output != NULL) {
         fclose(output);
     }
-    if (!completed) {
+    if (!completed && temporary_created) {
         unlink(temporary_path);
     }
     if (socket_fd >= 0) {
         close(socket_fd);
     }
+    return completed ? 0 : -1;
+}
+
+static int finish_download(const char *tracker_name, const char *path)
+{
+    char error[256];
+    if (dl_download_shared(path, config.download_dir, config.shared_dir,
+                           error, sizeof(error))) {
+        fprintf(stderr, "Peer download failed: %s\n", error);
+        return -1;
+    }
+    char name[PROTOCOL_NAME_MAX];
+    size_t length = strlen(tracker_name) - 6;
+    memcpy(name, tracker_name, length);
+    name[length] = '\0';
+    (void)update_one_file(name, 1);
+    if (unlink(path) && errno != ENOENT) perror("Removing completed tracker cache entry");
+    return 0;
+}
+
+static void command_get(void)
+{
+    char filename[PROTOCOL_NAME_MAX], path[1024];
+    if (read_prompt("Tracker filename to GET (for example file.track): ", filename,
+                    sizeof(filename)) || cached_path(filename, path, sizeof(path))) {
+        fprintf(stderr, "Invalid tracker filename.\n");
+        return;
+    }
+    if (pthread_mutex_trylock(&downloads_mutex)) {
+        fprintf(stderr, "Automatic recovery is active. Retry GET when it finishes this pass.\n");
+        return;
+    }
+    if (!fetch_metadata(filename, path)) (void)finish_download(filename, path);
+    pthread_mutex_unlock(&downloads_mutex);
 }
 
 static int wait_for_shutdown(unsigned int seconds)
@@ -520,7 +569,31 @@ static int wait_for_shutdown(unsigned int seconds)
 static void *periodic_update_thread(void *unused)
 {
     (void)unused;
-    while (!wait_for_shutdown(config.update_interval)) {
+    unsigned elapsed = 0;
+    while (!wait_for_shutdown(1)) {
+        /* Active jobs need to become sources during the demo, before the
+         * ordinary refresh interval for complete shared files elapses. */
+        DIR *cache = opendir(metadata_directory);
+        if (cache) {
+            struct dirent *entry;
+            while ((entry = readdir(cache)) != NULL) {
+                char path[1024];
+                if (cached_path(entry->d_name, path, sizeof(path))) continue;
+                char name[PROTOCOL_NAME_MAX];
+                size_t length = strlen(entry->d_name) - 6;
+                memcpy(name, entry->d_name, length);
+                name[length] = '\0';
+                dl_range *ranges;
+                size_t count;
+                if (dl_partial_ranges(config.download_dir, name, &ranges, &count)) continue;
+                for (size_t i = 0; i < count; ++i)
+                    (void)update_range(name, ranges[i].first, ranges[i].last, 1);
+                free(ranges);
+            }
+            closedir(cache);
+        }
+        if (++elapsed < config.update_interval) continue;
+        elapsed = 0;
         DIR *directory = opendir(config.shared_dir);
         struct dirent *entry;
         if (directory == NULL) {
@@ -543,11 +616,79 @@ static void *periodic_update_thread(void *unused)
     return NULL;
 }
 
+typedef struct retry_budget {
+    char name[PROTOCOL_NAME_MAX];
+    uint64_t signature;
+    unsigned attempts;
+    struct retry_budget *next;
+} retry_budget;
+
+static void recover_downloads(retry_budget **budgets)
+{
+    DIR *cache = opendir(metadata_directory);
+    if (!cache) return;
+    struct dirent *entry;
+    while ((entry = readdir(cache)) != NULL) {
+        char path[1024];
+        if (wait_for_shutdown(0)) break;
+        if (cached_path(entry->d_name, path, sizeof(path))) continue;
+        if (pthread_mutex_trylock(&downloads_mutex)) break;
+        if (access(path, F_OK) != 0) {
+            pthread_mutex_unlock(&downloads_mutex);
+            continue;
+        }
+        /* A failed refresh leaves the previous verified cache intact. */
+        (void)fetch_metadata(entry->d_name, path);
+        uint64_t signature;
+        if (!dl_source_signature(path, config.peer_ip, config.peer_port, &signature)) {
+            retry_budget **slot = budgets;
+            while (*slot && strcmp((*slot)->name, entry->d_name)) slot = &(*slot)->next;
+            if (!*slot) {
+                *slot = calloc(1, sizeof(**slot));
+                if (*slot) strcpy((*slot)->name, entry->d_name);
+            }
+            retry_budget *budget = *slot;
+            if (budget) {
+                if (budget->signature != signature) {
+                    budget->signature = signature;
+                    budget->attempts = 0;
+                }
+                if (budget->attempts < 3) {
+                    ++budget->attempts;
+                    if (!finish_download(entry->d_name, path)) {
+                        *slot = budget->next;
+                        free(budget);
+                    }
+                }
+            }
+        }
+        pthread_mutex_unlock(&downloads_mutex);
+    }
+    closedir(cache);
+}
+
+static void *recovery_thread(void *unused)
+{
+    (void)unused;
+    retry_budget *budgets = NULL;
+    do {
+        recover_downloads(&budgets);
+    } while (!wait_for_shutdown(config.update_interval));
+    while (budgets) {
+        retry_budget *next = budgets->next;
+        free(budgets);
+        budgets = next;
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     const char *config_path = argc > 1 ? argv[1] : "clientThreadConfig.cfg";
     pthread_t updater;
+    pthread_t recovery;
     int updater_started = 0;
+    int recovery_started = 0;
     char choice[32];
 
     if (argc > 2) {
@@ -558,7 +699,9 @@ int main(int argc, char **argv)
     if (load_config(config_path) != 0) {
         return EXIT_FAILURE;
     }
-    if (ensure_directory(config.shared_dir) != 0 || ensure_directory(config.download_dir) != 0) {
+    snprintf(metadata_directory, sizeof(metadata_directory), "%s/.trackers", config.download_dir);
+    if (ensure_directory(config.shared_dir) || ensure_directory(config.download_dir) ||
+        ensure_directory(metadata_directory)) {
         perror("Creating configured directories");
         return EXIT_FAILURE;
     }
@@ -570,6 +713,8 @@ int main(int argc, char **argv)
     } else {
         fprintf(stderr, "Warning: periodic update thread could not start.\n");
     }
+    recovery_started = pthread_create(&recovery, NULL, recovery_thread, NULL) == 0;
+    if (!recovery_started) fprintf(stderr, "Warning: automatic recovery thread could not start.\n");
 
     for (;;) {
         printf("\nPeer client (peer port %u)\n"
@@ -596,12 +741,13 @@ int main(int argc, char **argv)
         }
     }
 
-    if (updater_started) {
+    if (updater_started || recovery_started) {
         pthread_mutex_lock(&shutdown_mutex);
         shutting_down = 1;
         pthread_cond_broadcast(&shutdown_condition);
         pthread_mutex_unlock(&shutdown_mutex);
-        pthread_join(updater, NULL);
+        if (updater_started) pthread_join(updater, NULL);
+        if (recovery_started) pthread_join(recovery, NULL);
     }
     return EXIT_SUCCESS;
 }

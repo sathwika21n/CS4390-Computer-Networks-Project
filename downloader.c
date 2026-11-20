@@ -393,6 +393,32 @@ static ssize_t read_at(int fd, void *buffer, size_t length, off_t offset) {
     return result;
 }
 
+/* The directory lock excludes competing downloaders. The map lock coordinates
+ * publication of durable marks and resets with the separate serving process. */
+static int lock_map(int fd, int mode) {
+    int result;
+    do {
+        result = flock(fd, mode);
+    } while (result && errno == EINTR);
+    return result;
+}
+
+static int mark_complete(download_job *job, uint64_t mark) {
+    unsigned char completed = 1;
+    pthread_mutex_lock(&job->mutex);
+    int result = lock_map(job->map_fd, LOCK_EX);
+    if (!result) {
+        result = write_at(job->map_fd, &completed, 1, mark) || fdatasync(job->map_fd);
+        if (result) {
+            completed = 0;
+            (void)write_at(job->map_fd, &completed, 1, mark);
+        }
+        lock_map(job->map_fd, LOCK_UN);
+    }
+    pthread_mutex_unlock(&job->mutex);
+    return result;
+}
+
 static void *download_worker(void *argument) {
     worker_args *worker = argument;
     download_job *job = worker->job;
@@ -411,7 +437,6 @@ static void *download_worker(void *argument) {
         uint64_t remaining = job->track->size - offset;
         size_t length = remaining < CHUNK_LIMIT ? (size_t)remaining : CHUNK_LIMIT;
         unsigned char buffer[CHUNK_LIMIT];
-        completed = 1;
         const char *error = NULL;
         if (marked < 0) {
             error = "cannot read resume state";
@@ -419,8 +444,7 @@ static void *download_worker(void *argument) {
             error = "no remaining peer could serve the required bytes";
         } else if (write_at(job->part_fd, buffer, length, offset) ||
                    fdatasync(job->part_fd) ||
-                   write_at(job->map_fd, &completed, 1, mark) ||
-                   fdatasync(job->map_fd)) {
+                   mark_complete(job, mark)) {
             error = "cannot persist downloaded chunk";
         }
         if (error) {
@@ -463,20 +487,21 @@ static int prepare_state(download_job *job, int dir) {
     struct stat part_info, map_info;
     job->part_fd = open_state(dir, "data", &part_info);
     job->map_fd = open_state(dir, "map", &map_info);
-    if (job->part_fd < 0 || job->map_fd < 0) return -1;
+    if (job->part_fd < 0 || job->map_fd < 0 || lock_map(job->map_fd, LOCK_EX)) return -1;
 
     char expected[MAP_HEADER_SIZE] = {0}, stored[MAP_HEADER_SIZE];
     snprintf(expected, sizeof(expected), "DL1 %" PRIu64 " %s", job->track->size, job->track->md5);
     if ((uint64_t)part_info.st_size == job->track->size &&
         read_at(job->map_fd, stored, sizeof(stored), 0) == sizeof(stored) &&
-        memcmp(stored, expected, sizeof(stored)) == 0) return 0;
+        memcmp(stored, expected, sizeof(stored)) == 0)
+        return lock_map(job->map_fd, LOCK_UN);
 
     /* Clear old completion marks before reusing any data from an earlier version. */
     if (ftruncate(job->map_fd, 0) || fdatasync(job->map_fd) ||
         ftruncate(job->part_fd, 0) || ftruncate(job->part_fd, (off_t)job->track->size) ||
         fdatasync(job->part_fd) || write_at(job->map_fd, expected, sizeof(expected), 0) ||
         fdatasync(job->map_fd)) return -1;
-    return 0;
+    return lock_map(job->map_fd, LOCK_UN);
 }
 
 static int content_matches(const char *path, const track_file *track) {
@@ -487,7 +512,43 @@ static int content_matches(const char *path, const track_file *track) {
     return strcmp(digest, track->md5) == 0 ? 0 : 1;
 }
 
-static const char *download_track(const char *directory, track_file *track) {
+static int publish_shared(const char *output, const char *shared, const track_file *track) {
+    char destination[4096], temporary[4096], staging[4096];
+    if (snprintf(destination, sizeof(destination), "%s/%s", shared, track->name) >=
+        (int)sizeof(destination)) return -1;
+    if (!link(output, destination)) return 0;
+    if (errno == EEXIST) return content_matches(destination, track);
+    if (errno != EXDEV ||
+        snprintf(staging, sizeof(staging), "%s/.downloader", shared) >= (int)sizeof(staging) ||
+        snprintf(temporary, sizeof(temporary), "%s/share-XXXXXX", staging) >= (int)sizeof(temporary) ||
+        (mkdir(staging, 0700) && errno != EEXIST)) return -1;
+
+    int source = open(output, O_RDONLY | O_NOFOLLOW);
+    if (source < 0) return -1;
+    int target = mkstemp(temporary);
+    if (target < 0) {
+        close(source);
+        return -1;
+    }
+    unsigned char buffer[8192];
+    uint64_t offset = 0;
+    int result = -1;
+    while (offset < track->size) {
+        ssize_t amount = read_at(source, buffer, sizeof(buffer), (off_t)offset);
+        if (amount <= 0 || write_at(target, buffer, (size_t)amount, offset)) goto done;
+        offset += (uint64_t)amount;
+    }
+    if (fdatasync(target) || content_matches(temporary, track)) goto done;
+    if (!link(temporary, destination)) result = 0;
+    else if (errno == EEXIST) result = content_matches(destination, track);
+done:
+    close(target);
+    close(source);
+    unlink(temporary);
+    return result;
+}
+
+static const char *download_track(const char *directory, const char *shared, track_file *track) {
     char output[4096], state[4096], job_path[4096], part[4096];
     if (snprintf(output, sizeof(output), "%s/%s", directory, track->name) >= (int)sizeof(output) ||
         snprintf(state, sizeof(state), "%s/.downloader", directory) >= (int)sizeof(state) ||
@@ -495,6 +556,14 @@ static const char *download_track(const char *directory, track_file *track) {
         snprintf(part, sizeof(part), "%s/data", job_path) >= (int)sizeof(part))
         return "Download path is too long";
 
+    struct stat info;
+    if (shared) {
+        char shared_path[4096];
+        if (snprintf(shared_path, sizeof(shared_path), "%s/%s", shared, track->name) >=
+            (int)sizeof(shared_path)) return "Shared path is too long";
+        if (!lstat(shared_path, &info) && content_matches(shared_path, track))
+            return "Shared destination already exists and does not match tracker metadata";
+    }
     const char *error = "Cannot open download state directory";
     if (mkdir(state, 0700) && errno != EEXIST) return error;
     int root = open(state, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
@@ -511,7 +580,6 @@ static const char *download_track(const char *directory, track_file *track) {
     error = "Another download owns this destination or its lock is unavailable";
     if (flock(dir, LOCK_EX | LOCK_NB)) goto done;
 
-    struct stat info;
     if (lstat(output, &info) == 0) {
         error = "Destination already exists and does not match tracker size and MD5";
         if (content_matches(output, track)) goto done;
@@ -528,7 +596,8 @@ static const char *download_track(const char *directory, track_file *track) {
         if (verified < 0) goto done;
         if (verified > 0) {
             error = "Final MD5 mismatch; GET the tracker again to refetch all chunks";
-            if (ftruncate(job.map_fd, 0) || fdatasync(job.map_fd))
+            if (lock_map(job.map_fd, LOCK_EX) ||
+                ftruncate(job.map_fd, 0) || fdatasync(job.map_fd))
                 error = "Final MD5 mismatch and resume map could not be reset";
             goto done;
         }
@@ -536,6 +605,8 @@ static const char *download_track(const char *directory, track_file *track) {
         if (linkat(dir, "data", AT_FDCWD, output, 0)) goto done;
     }
 
+    error = "Verified payload could not be published in the shared directory";
+    if (shared && publish_shared(output, shared, track)) goto done;
     if ((unlinkat(dir, "data", 0) && errno != ENOENT) ||
         (unlinkat(dir, "map", 0) && errno != ENOENT) ||
         unlinkat(root, track->name, AT_REMOVEDIR))
@@ -553,13 +624,139 @@ done:
 
 int dl_download_track(const char *tracker_path, const char *directory,
                       char *error, size_t error_size) {
+    return dl_download_shared(tracker_path, directory, NULL, error, error_size);
+}
+
+int dl_download_shared(const char *tracker_path, const char *directory,
+                       const char *shared, char *error, size_t error_size) {
     if (!tracker_path || !*tracker_path || !directory || !*directory)
         return fail(error, error_size, "Invalid tracker path or destination directory");
     track_file track = {0};
     const char *message = "Cannot read valid tracker metadata";
-    if (!read_track(tracker_path, &track)) message = download_track(directory, &track);
+    if (!read_track(tracker_path, &track)) message = download_track(directory, shared, &track);
     free(track.peers);
     if (message) return fail(error, error_size, message);
     if (error && error_size) error[0] = '\0';
     return 0;
+}
+
+/* Open both files relative to one job directory and pin the map generation
+ * until the caller finishes inspecting marks or reading marked bytes. */
+static int open_partial(const char *directory, const char *name,
+                        int *map, int *data, uint64_t *size) {
+    char path[4096];
+    if (!track_name_valid(name) ||
+        snprintf(path, sizeof(path), "%s/.downloader/%s", directory, name) >= (int)sizeof(path))
+        return -1;
+    int dir = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (dir < 0) return -1;
+    *map = openat(dir, "map", O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    *data = -1;
+    if (*map < 0 || lock_map(*map, LOCK_SH)) goto failed;
+    *data = openat(dir, "data", O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    struct stat info;
+    char header[MAP_HEADER_SIZE + 1] = {0}, digest[33];
+    if (*data < 0 || fstat(*data, &info) || !S_ISREG(info.st_mode) ||
+        read_at(*map, header, MAP_HEADER_SIZE, 0) != MAP_HEADER_SIZE ||
+        sscanf(header, "DL1 %" SCNu64 " %32[0-9a-f]", size, digest) != 2 ||
+        strlen(digest) != 32 || *size > INT64_MAX || *size != (uint64_t)info.st_size)
+        goto failed;
+    close(dir);
+    return 0;
+failed:
+    if (*map >= 0) close(*map);
+    if (*data >= 0) close(*data);
+    close(dir);
+    return -1;
+}
+
+int dl_read_partial(const char *directory, const char *name, uint64_t offset,
+                    void *buffer, size_t length) {
+    int map, data, result = -1;
+    uint64_t size;
+    if (!length || length > CHUNK_LIMIT || open_partial(directory, name, &map, &data, &size))
+        return -1;
+    if (offset >= size || length > size - offset) goto done;
+    for (uint64_t slot = offset / CHUNK_LIMIT; slot <= (offset + length - 1) / CHUNK_LIMIT; ++slot) {
+        unsigned char mark;
+        if (read_at(map, &mark, 1, (off_t)(MAP_HEADER_SIZE + slot)) != 1 || mark != 1)
+            goto done;
+    }
+    if (read_at(data, buffer, length, (off_t)offset) == (ssize_t)length) result = 0;
+done:
+    close(data);
+    close(map);
+    return result;
+}
+
+int dl_partial_ranges(const char *directory, const char *name, dl_range **ranges, size_t *count) {
+    *ranges = NULL;
+    *count = 0;
+    int map, data;
+    uint64_t size;
+    if (open_partial(directory, name, &map, &data, &size)) return -1;
+    uint64_t slots = (size + CHUNK_LIMIT - 1) / CHUNK_LIMIT, slot = 0;
+    size_t capacity = 0;
+    int result = -1;
+    unsigned char marks[4096];
+    while (slot < slots) {
+        size_t wanted = slots - slot < sizeof(marks) ? (size_t)(slots - slot) : sizeof(marks);
+        ssize_t amount = read_at(map, marks, wanted, (off_t)(MAP_HEADER_SIZE + slot));
+        if (amount < 0) goto done;
+        if (!amount) break;
+        for (ssize_t i = 0; i < amount; ++i, ++slot) {
+            if (marks[i] != 1) continue;
+            uint64_t first = slot * CHUNK_LIMIT;
+            uint64_t last = first + CHUNK_LIMIT <= size ? first + CHUNK_LIMIT - 1 : size - 1;
+            if (*count && (*ranges)[*count - 1].last + 1 == first) {
+                (*ranges)[*count - 1].last = last;
+                continue;
+            }
+            if (*count == capacity) {
+                if (capacity > SIZE_MAX / (2 * sizeof(**ranges))) goto done;
+                capacity = capacity ? 2 * capacity : 8;
+                dl_range *grown = realloc(*ranges, capacity * sizeof(**ranges));
+                if (!grown) goto done;
+                *ranges = grown;
+            }
+            (*ranges)[(*count)++] = (dl_range){first, last};
+        }
+    }
+    result = 0;
+done:
+    close(data);
+    close(map);
+    if (result) {
+        free(*ranges);
+        *ranges = NULL;
+        *count = 0;
+    }
+    return result;
+}
+
+static uint64_t source_hash(const char *text) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (; *text; ++text) hash = (hash ^ (unsigned char)*text) * UINT64_C(1099511628211);
+    return hash;
+}
+
+int dl_source_signature(const char *tracker_path, const char *own_ip,
+                        uint16_t own_port, uint64_t *signature) {
+    track_file track = {0};
+    int result = read_track(tracker_path, &track);
+    if (!result) {
+        *signature = source_hash(track.md5) + track.size;
+        /* Addition makes row order irrelevant. Timestamp-only refreshes do
+         * not revive exhausted attempts, but changed endpoints or ranges do. */
+        for (size_t i = 0; i < track.count; ++i) {
+            const dl_peer *p = &track.peers[i];
+            if (p->port == own_port && !strcmp(p->host, own_ip)) continue;
+            char entry[96];
+            snprintf(entry, sizeof(entry), "%s:%u:%" PRIu64 ":%" PRIu64,
+                     p->host, (unsigned)p->port, p->start, p->end);
+            *signature += source_hash(entry);
+        }
+    }
+    free(track.peers);
+    return result;
 }
