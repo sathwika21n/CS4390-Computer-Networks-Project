@@ -1,127 +1,97 @@
 # Downloader
 
-This Linux/POSIX C module implements four features: connect to a TCP peer,
-request/receive chunks, divide a file into segments, and reconstruct the output
-using byte offsets. It is blocking and single-threaded, with one peer and one
-connection per chunk. It has no tracker dependency.
+The peer client starts a download after checking the tracker file against the
+MD5 in the GET response. The downloader then verifies the payload against the
+size and MD5 inside that tracker file. GET again to resume an interrupted
+download with a fresh list of peers. The menu waits for the download to finish
+or report an error.
 
-## Architecture and protocol
+## Protocol and scheduling
 
-Caller -> dl_download -> sequential segment loop -> fetch_chunk -> TCP peer
-                                               -> pwrite -> output file
+The peer server accepts `GET_CHUNK filename offset length\n` and replies with
+`CHUNK length\n` followed by exactly that many bytes. Offsets are zero-based.
+Each request asks for at most 1024 bytes and uses a separate TCP connection.
+In tracker metadata, an update row is `IPv4:port:first:last:timestamp` with
+inclusive endpoints. Initial rows can advertise the file size as the last
+byte. The downloader clips all ranges at EOF.
 
-The caller supplies host, peer port, remote filename, destination, known file
-size, and chunk size through dl_options in downloader.h. The peer must have the
-whole file. Metadata discovery is future integration work.
+The caller and up to three additional pthreads claim distinct slots from a
+shared queue. Each slot covers up to 1024 bytes. A worker chooses the newest
+idle peer that can serve the entire request. If all eligible peers are busy,
+it tries the newest of them. After a failure, each remaining eligible peer
+can be tried once for that request. If necessary, a worker divides a slot at
+advertised range boundaries. A slot is recorded complete after all its bytes
+have been received and written. Each TCP attempt has a 2.5-second deadline
+covering connect, request and response. Tracker GET itself uses the existing
+tracker client behavior.
 
-Provisional protocol (coordinate with Kriti before integration):
+Resume state lives under `download_dir/.downloader/<filename>/`. The downloader
+syncs each slot's data before persisting its completion mark. Resume is keyed
+to the expected size and MD5. If the completed payload has the wrong MD5,
+completion marks are cleared so the next GET can refetch all slots. Verified
+files are published with a same-filesystem hard link that refuses to replace an
+existing destination. A per-file lock prevents concurrent writers. Use a Linux
+filesystem that supports hard links and directory locks. Verified metadata is
+saved under `download_dir/.trackers/` so a tracker GET can refresh metadata
+without replacing a payload that happens to have the same filename.
 
-```text
-GET_CHUNK filename offset length\n
-CHUNK length\n
-[exactly length binary bytes]
-```
+`dl_download_track()` is the production entry point. The test CLI also retains
+its original direct single-peer mode through `dl_download()`.
 
-Names are printable ASCII without spaces. Requests including newline are limited
-to 1024 bytes. Headers must match the requested length. This protocol is test
-scaffolding, not a claim that the team's peer server already supports it.
+## Build on Linux or Ubuntu WSL
 
-## Function walkthrough using Beej's concepts
-
-Read downloader.h, then dl_download(), then fetch_chunk() and its helpers.
-Reference: [Beej's Guide](https://beej.us/guide/bgnet/html/index.html), sections
-5.1, 5.2, 5.4, 5.7, 5.9 and 7.4.
-
-1. dl_download validates options and creates an exclusive output with open().
-   Existing output is refused. A zero-byte file needs no network requests.
-2. Segment the file in a loop: length = min(chunk_size, file_size - offset).
-   For 10 bytes and chunk size 4, requests are (0,4), (4,4), (8,2).
-   These are logical byte ranges; no separate segment files are created.
-3. connect_peer calls getaddrinfo to translate host/port into socket addresses.
-   socket() creates an endpoint and returns a file descriptor, or -1 on error.
-   SOCK_STREAM requests TCP. connect() establishes the outgoing connection.
-   Each failed address is closed before trying another resolved address.
-4. send_all sends the request. send() reports how many bytes it accepted, which
-   can be fewer than requested; the loop advances by that count. MSG_NOSIGNAL
-   prevents a disconnected peer from terminating this Linux process via SIGPIPE.
-5. receive_exact loops around recv(). A positive result counts received bytes;
-   zero means orderly peer shutdown, which is failure before the expected bytes
-   arrive; -1 means error. Interrupted operations are retried. TCP carries bytes,
-   so a send call does not correspond to a recv call or a file segment.
-6. fetch_chunk reads the header one byte at a time up to newline, checks it,
-   then receives the binary body in blocks of at most 64 KiB. Binary payloads
-   have explicit lengths; they are not NUL-terminated strings.
-7. write_at loops around pwrite(), which writes at an explicit file offset.
-   Offset 4 means the fifth byte, because offsets start at zero. For a block
-   inside a segment, destination = segment offset + bytes already received.
-   This places bytes directly in final order; no separate merge pass is needed.
-8. close() releases each socket, including error paths. Closing the output is
-   checked too. fail() copies a diagnostic into the caller's bounded buffer.
-   dl_download returns 0 only after every segment and output close succeeds.
-
-## Build and test
-
-From the repository root in Linux or Ubuntu/WSL, with GCC and Python 3:
+Install GCC, make and the OpenSSL development headers. Run from the checkout
+root.
 
 ```sh
-gcc -std=c11 -Wall -Wextra -Wpedantic -Werror downloader.c tests/downloader_cli.c -o tests/downloader_cli
-python3 tests/test_downloader.py
+make clean && make
 ```
 
-From PowerShell prefix each command with `wsl -d Ubuntu --`.
-No pthread build flag is needed. This is POSIX source, not native Windows Winsock.
+The Makefile outputs `tracker`, `peer_client` and `peer_server`, which are
+tracked in the repository. Keep rebuilt binaries out of source commits.
 
-On 2026-11-09 the revised source compiled successfully in Ubuntu/WSL with the
-flags above and no warnings. All seven revised integration tests subsequently passed in Ubuntu/WSL in 3.641 seconds.
+## LAN demo
 
-Seven test methods cover text/binary/empty files, exact segment boundaries and
-short final segments, ordered requests, segments larger than the transfer buffer,
-fragmented TCP responses, malformed headers, early EOF, existing destinations,
-invalid options, and refused connections. Successful downloads are compared byte
-for byte. The Python mock runs in background threads to serve the test client;
-the C downloader itself has no threads. These are local TCP tests, not a physical
-two-machine demonstration.
+Build with `make clean && make` in each machine's checkout. Use the tracker
+machine's reachable IPv4 address for `tracker_host`. Each peer needs its own
+reachable IPv4 address for `peer_ip`. Allow inbound TCP 3490 on the tracker and
+TCP 9001 on each serving peer. On each peer, keep `shared_dir=./shared_files`,
+`peer_port=9001` and `download_dir=./downloads` in `clientThreadConfig.cfg`.
+The peer server currently uses TCP 9001 and `./shared_files` from its source.
+Changing `serverThreadConfig.cfg` alone does not change those settings.
 
-Manual test, using two terminals (choose a fresh destination):
+1. On the tracker machine, start `./tracker` from the repository root. The
+   supplied `sconfig` listens on port 3490 and stores metadata in `torrents/`.
+2. On the source peer, create a fresh test file and start its server.
 
-```sh
-python3 tests/mock_peer.py sample.bin --port 51001
-./tests/downloader_cli 127.0.0.1 51001 sample.bin received.bin SIZE 4096
-cmp sample.bin received.bin
-```
+   ```sh
+   mkdir -p shared_files
+   dd if=/dev/urandom of=shared_files/demo-4390.bin bs=1024 count=8
+   md5sum shared_files/demo-4390.bin
+   ./peer_server
+   ```
 
-Replace SIZE with the exact byte count (`wc -c < sample.bin`). For two machines,
-bind the mock with `--bind 0.0.0.0` and use its reachable address on the client.
-The CLI arguments are HOST PORT NAME OUTPUT SIZE CHUNK.
+3. In a second terminal on the source peer, register the file and leave the
+   client running to refresh the advertisement.
 
-## Limits and remaining work
+   ```sh
+   ./peer_client clientThreadConfig.cfg
+   ```
 
-Failure stops immediately and can leave an incomplete destination. Inspect/remove
-that output before retrying; this version does not resume. Blocking network calls
-can wait indefinitely for a silent peer. File size is supplied by the caller;
-there is no hash validation, authentication, or crash-durable publication.
-The API limits file size to signed 64-bit filesystem offsets.
+   Choose **1**, enter `demo-4390.bin`, then enter `demo` as the description.
+   Look for `createtracker: succ`. On a repeat demo, use a fresh filename or
+   reuse the exact same source bytes. Option **2** refreshes an existing entry.
+4. On the receiving peer, run the production client and choose **3** to list
+   the file. Choose **4** and enter `demo-4390.bin.track`. The client should log
+   peer selection, byte offsets, completion and the verified MD5.
 
-Later increments: multiple peer/range metadata, newest-peer selection, fallback
-and timeouts, concurrency, persistent resume, hashes and safe final publication.
-Integrate tracker metadata/menu/update calls with Sathwika; agree server framing
-and checksum handling with Kriti; coordinate tracker semantics with Jazminee.
-Team feature completion is not established by this downloader branch.
+   ```sh
+   ./peer_client clientThreadConfig.cfg
+   ```
 
-## Preserved full version and staging
-
-Before edits, the original source, header, docs, ignore file, and entire tests
-folder were copied to backups/downloader-full-2026-11-09/. SHA256.json records
-SHA-256 hashes of those original files. This ignored local backup includes the
-advanced implementation and original tests. Keep it locally for later increments;
-it is not included in this first commit. Restore selected files by copying them
-back after reviewing; do not overwrite the current increment accidentally.
-
-Stage exactly these files after reviewing and running tests:
-
-```sh
-git add -- .gitignore README.md DOWNLOADER.md downloader.c downloader.h tests/downloader_cli.c tests/mock_peer.py tests/test_downloader.py
-```
-
-Suggested commit message: `Add single-threaded TCP chunk downloader`
-Stage only the listed source and documentation files; exclude the local backup and compiled binary.
+5. On the receiving peer, run `md5sum downloads/demo-4390.bin` and compare
+   it with the source hash. To demonstrate multiple sources, copy the exact
+   source bytes into a second serving peer's `shared_files`, start its
+   `./peer_server`, and choose **2** for `demo-4390.bin` in its client.
+   GET from a receiver where the destination does not yet exist. A larger
+   source file makes concurrent use easier to observe.

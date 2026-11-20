@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "protocol.h"
+#include "downloader.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -390,6 +391,7 @@ static void command_get(void)
     char filename[PROTOCOL_NAME_MAX];
     char request[PROTOCOL_LINE_MAX];
     char line[PROTOCOL_LINE_MAX];
+    char metadata_dir[1024];
     char output_path[1024];
     char temporary_path[1100];
     char local_md5[PROTOCOL_MD5_HEX_LEN + 1];
@@ -403,11 +405,18 @@ static void command_get(void)
         fprintf(stderr, "Invalid filename.\n");
         return;
     }
-    if (snprintf(output_path, sizeof(output_path), "%s/%s", config.download_dir,
+    /* Keep verified tracker files out of the payload filename namespace. */
+    if (snprintf(metadata_dir, sizeof(metadata_dir), "%s/.trackers", config.download_dir)
+            >= (int)sizeof(metadata_dir) ||
+        snprintf(output_path, sizeof(output_path), "%s/%s", metadata_dir,
                  filename) >= (int)sizeof(output_path) ||
         snprintf(temporary_path, sizeof(temporary_path), "%s.part.%ld", output_path,
                  (long)getpid()) >= (int)sizeof(temporary_path)) {
         fprintf(stderr, "Download path is too long.\n");
+        return;
+    }
+    if (ensure_directory(metadata_dir) != 0) {
+        perror("Creating tracker metadata directory");
         return;
     }
     snprintf(request, sizeof(request), "<GET %s >\n", filename);
@@ -471,6 +480,12 @@ static void command_get(void)
     }
     printf("Saved %s (MD5 verified: %s)\n", output_path, local_md5);
     completed = 1;
+    close(socket_fd);
+    socket_fd = -1;
+    char download_error[256];
+    if (dl_download_track(output_path, config.download_dir,
+                          download_error, sizeof(download_error)) != 0)
+        fprintf(stderr, "Peer download failed: %s\n", download_error);
 
 cleanup:
     if (output != NULL) {

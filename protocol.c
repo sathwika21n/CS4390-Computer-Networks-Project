@@ -131,8 +131,7 @@ int protocol_parse_response(const char *line, protocol_response_t *response)
         (strcmp(first, "succ>") == 0 || strcmp(first, "fail>") == 0 ||
          strcmp(first, "ferr>") == 0)) {
         response->kind = PROTOCOL_RESPONSE_CREATE_TRACKER;
-        snprintf(response->status, sizeof(response->status), "%s", first);
-        response->status[strlen(response->status) - 1] = '\0';
+        memcpy(response->status, first, strlen(first) - 1);
         return 0;
     }
 
@@ -141,8 +140,7 @@ int protocol_parse_response(const char *line, protocol_response_t *response)
          strcmp(second, "ferr>") == 0)) {
         response->kind = PROTOCOL_RESPONSE_UPDATE_TRACKER;
         snprintf(response->filename, sizeof(response->filename), "%s", first);
-        snprintf(response->status, sizeof(response->status), "%s", second);
-        response->status[strlen(response->status) - 1] = '\0';
+        memcpy(response->status, second, strlen(second) - 1);
         return 0;
     }
 
@@ -159,11 +157,13 @@ int protocol_parse_response(const char *line, protocol_response_t *response)
     }
 
     /* A list item has the form: <index filename filesize md5>. */
+    unsigned long long filesize;
     fields = sscanf(line, " <%llu %255s %llu %32[0-9a-fA-F]>%1s", &number, first,
-                    &response->filesize, response->md5, extra);
+                    &filesize, response->md5, extra);
     if (fields == 4 && valid_md5(response->md5)) {
         response->kind = PROTOCOL_RESPONSE_LIST_ITEM;
         response->index = (uint64_t)number;
+        response->filesize = (uint64_t)filesize;
         snprintf(response->filename, sizeof(response->filename), "%s", first);
         return 0;
     }
