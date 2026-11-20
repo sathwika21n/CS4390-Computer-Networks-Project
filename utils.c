@@ -1,3 +1,7 @@
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
 #include "utils.h"
 #include <dirent.h>
 
@@ -150,7 +154,7 @@ long getFileSize(const char *filename) {
     return -1;
 }
 
-// Calculate MD5 hash using the custom built-in implementation
+// Calculate MD5 hash using the custom built-in implementation (md5_string >= 33 bytes)
 int calculateMD5(const char *filename, char *md5_string) {
     FILE *file = fopen(filename, "rb");
     if (!file) return -1;
@@ -159,9 +163,14 @@ int calculateMD5(const char *filename, char *md5_string) {
     MD5_Init_Custom(&mdContext);
 
     unsigned char buffer[1024];
-    int bytes;
+    size_t bytes;
     while ((bytes = fread(buffer, 1, sizeof(buffer), file)) != 0) {
-        MD5_Update_Custom(&mdContext, buffer, bytes);
+        MD5_Update_Custom(&mdContext, buffer, (unsigned int)bytes);
+    }
+
+    if (ferror(file)) {
+        fclose(file);
+        return -1;
     }
 
     unsigned char digest[16];
@@ -169,7 +178,7 @@ int calculateMD5(const char *filename, char *md5_string) {
     fclose(file);
 
     for (int i = 0; i < 16; i++) {
-        sprintf(&md5_string[i * 2], "%02x", (unsigned int)digest[i]);
+        snprintf(&md5_string[i * 2], 3, "%02x", (unsigned int)digest[i]);
     }
     md5_string[32] = '\0';
     return 0;
@@ -177,6 +186,7 @@ int calculateMD5(const char *filename, char *md5_string) {
 
 // Read a specific chunk of a file at a given byte offset
 int readChunk(const char *filename, long offset, char *buffer, size_t size) {
+    if (offset < 0) return -1;
     FILE *file = fopen(filename, "rb");
     if (!file) return -1;
 
@@ -186,14 +196,17 @@ int readChunk(const char *filename, long offset, char *buffer, size_t size) {
     }
 
     size_t bytesRead = fread(buffer, 1, size, file);
+    int failed = ferror(file);
     fclose(file);
-    return (int)bytesRead;
+    return failed ? -1 : (int)bytesRead;
 }
 
-// Write a specific chunk of a file at a given byte offset
+// Write a specific chunk of a file at a given byte offset without truncating existing data
 int writeChunk(const char *filename, long offset, const char *buffer, size_t size) {
+    if (offset < 0) return -1;
     FILE *file = fopen(filename, "r+b");
     if (!file) {
+        if (errno != ENOENT) return -1;
         file = fopen(filename, "wb");
         if (!file) return -1;
     }
@@ -204,16 +217,20 @@ int writeChunk(const char *filename, long offset, const char *buffer, size_t siz
     }
 
     size_t bytesWritten = fwrite(buffer, 1, size, file);
+    int failed = ferror(file);
     fclose(file);
-    return (int)bytesWritten;
+    return failed ? -1 : (int)bytesWritten;
 }
 
 // Ensure the shared directory exists on startup
 void initSharedFolder(const char *path) {
     struct stat st = {0};
     if (stat(path, &st) == -1) {
-        mkdir(path, 0700);
-        printf("[SharedFolder] Created missing directory: %s\n", path);
+        if (mkdir(path, 0700) == 0) {
+            printf("[SharedFolder] Created missing directory: %s\n", path);
+        } else {
+            perror("[SharedFolder] Failed to create directory");
+        }
     } else {
         printf("[SharedFolder] Using existing directory: %s\n", path);
     }
