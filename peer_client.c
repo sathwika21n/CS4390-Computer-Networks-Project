@@ -415,7 +415,7 @@ static int cached_path(const char *filename, char *path, size_t size)
            snprintf(path, size, "%s/%s", metadata_directory, filename) >= (int)size ? -1 : 0;
 }
 
-static int fetch_metadata(const char *filename, const char *output_path)
+static int fetch_metadata(const char *filename, const char *output_path, int quiet)
 {
     char request[PROTOCOL_LINE_MAX];
     char line[PROTOCOL_LINE_MAX];
@@ -499,7 +499,9 @@ static int fetch_metadata(const char *filename, const char *output_path)
         perror("Saving downloaded tracker file");
         goto cleanup;
     }
-    printf("Saved %s (MD5 verified: %s)\n", output_path, local_md5);
+    if (!quiet) {
+        printf("Saved %s (MD5 verified: %s)\n", output_path, local_md5);
+    }
     completed = 1;
 
 cleanup:
@@ -544,7 +546,7 @@ static void command_get(void)
         fprintf(stderr, "Automatic recovery is active. Retry GET when it finishes this pass.\n");
         return;
     }
-    if (!fetch_metadata(filename, path)) (void)finish_download(filename, path);
+    if (!fetch_metadata(filename, path, 0)) (void)finish_download(filename, path);
     pthread_mutex_unlock(&downloads_mutex);
 }
 
@@ -638,7 +640,7 @@ static void recover_downloads(retry_budget **budgets)
             continue;
         }
         /* A failed refresh leaves the previous verified cache intact. */
-        (void)fetch_metadata(entry->d_name, path);
+        (void)fetch_metadata(entry->d_name, path, 1);
         uint64_t signature;
         if (!dl_source_signature(path, config.peer_ip, config.peer_port, &signature)) {
             retry_budget **slot = budgets;
