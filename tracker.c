@@ -277,20 +277,10 @@ static void handle_update(int fd, const protocol_request_t *req) {
         unsigned int port = 0;
         unsigned long long first, end;
         long long timestamp = 0;
-        if (is_peer_entry(line, ip, sizeof(ip), &port, &first, &end, &timestamp)) {
-            if (timestamp <= 0 || (long long)now - timestamp > dead_peer_seconds)
-                continue;
-            if (!strcmp(ip, req->ip_address) && port == req->port) {
-                /* Existing disjoint chunks remain available after a new update. */
-                if (filesize && first < (unsigned long long)filesize) {
-                    if (end >= (unsigned long long)filesize) end = (unsigned long long)filesize - 1;
-                    if (first <= end && add_range(&ranges, &count, &capacity, first, end)) {
-                        ok = 0;
-                        break;
-                    }
-                }
-                continue;
-            }
+        if (is_peer_entry(line, ip, sizeof(ip), &p, &first, &end, &timestamp)) {
+            /* The requesting peer gets a fresh entry below. */
+            if (strcmp(ip, req->ip_address) == 0 && p == req->port) continue;
+            if (timestamp <= 0 || (long long)now - timestamp > dead_peer_seconds) continue;
         }
         if (fputs(line, dst) == EOF) { ok = 0; break; }
     }

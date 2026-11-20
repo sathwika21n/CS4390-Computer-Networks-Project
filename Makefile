@@ -1,6 +1,11 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -pthread -O2 -Wno-deprecated-declarations
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
 LIBS = -lcrypto
+else
+LIBS =
+endif
 
 all: tracker peer_client peer_server
 
