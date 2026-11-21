@@ -73,9 +73,8 @@ cleanup() {
     wait 2>/dev/null || true
     echo "Demo cleanup complete."
 }
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap cleanup EXIT
+
+trap cleanup INT TERM EXIT
 
 echo "=== Cleaning old builds and stale .track files ==="
 make clean || exit 1
@@ -221,10 +220,35 @@ monitor_large_download() {
     fi
 }
 
+print_peer_snapshot() {
+    local start_idx="$1"
+    local end_idx="$2"
+
+    for i in $(seq "$start_idx" "$end_idx"); do
+        local log_file="$DEMO_ROOT/peer${i}/client.log"
+        local dl_dir="$DEMO_ROOT/peer${i}/downloads"
+        local small_sz large_sz last_msg
+
+        small_sz=$(stat -c%s "$dl_dir/$SMALL_FILE" 2>/dev/null || echo 0)
+        large_sz=$(stat -c%s "$dl_dir/$LARGE_FILE" 2>/dev/null || echo 0)
+        last_msg=$(grep -v -E '^(Peer client \(|1\) createtracker|2\) updatetracker|3\) LIST|4\) GET tracker file|0\) Quit|Choice:)' "$log_file" 2>/dev/null | tail -n 1 || true)
+
+        if [ -n "$last_msg" ]; then
+            echo "Peer${i}: small=${small_sz}/${SMALL_BYTES}B, large=${large_sz}/${LARGE_BYTES}B | ${last_msg}"
+        else
+            echo "Peer${i}: small=${small_sz}/${SMALL_BYTES}B, large=${large_sz}/${LARGE_BYTES}B"
+        fi
+    done
+}
+
 echo "=== t = 0s: Starting tracker and seed peers ==="
 ./tracker > "$DEMO_ROOT/tracker.log" 2>&1 &
 TRACKER_PID=$!
 PIDS+=("$TRACKER_PID")
+# ./tracker > "$DEMO_ROOT/tracker.log" 2>&1 &
+# TRACKER_PID=$!
+# PIDS+=("$TRACKER_PID")
+
 sleep 1
 if ! kill -0 "$TRACKER_PID" 2>/dev/null; then
     echo "ERROR: Tracker failed to start (check $DEMO_ROOT/tracker.log)." >&2
@@ -251,8 +275,13 @@ for i in $(seq 3 8); do
     fi
 done
 
-echo "=== Waiting 60s before starting Peers 9 to 13 ==="
-sleep 60
+echo "=== Waiting 60s (total 1m 30s) before starting Peers 9 to 13 and stopping Peers 1 & 2 ==="
+sleep 50
+
+echo "=== ~t = 80s: Download progress check (Peers 3 to 8) ==="
+print_peer_snapshot 3 8
+
+sleep 10
 
 echo "=== t ≈ 90s: Starting Peers 9 to 13 ==="
 for i in $(seq 9 13); do
@@ -265,6 +294,12 @@ echo "=== Stopping Peer1 and Peer2 ==="
 stop_peer "peer1"
 stop_peer "peer2"
 
+sleep 2
+echo "=== ~t = 1m 32s: Post-1m30s status check (Peers 3 to 13) ==="
+print_peer_snapshot 3 13
+
 echo "=== Demo running; logs in ${DEMO_ROOT}/. Press Ctrl+C to stop. ==="
 echo "Large-file timing result: ${DEMO_ROOT}/large_download_time.txt"
-wait "$TRACKER_PID"
+
+wait
+# wait "$TRACKER_PID"
